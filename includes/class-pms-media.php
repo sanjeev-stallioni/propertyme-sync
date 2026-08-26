@@ -36,6 +36,20 @@ class PMS_Media {
 				return 0;
 			}
 			$name = basename( (string) wp_parse_url( $src, PHP_URL_PATH ) );
+			// PropertyMe S3 asset URLs carry no file extension; sideload rejects
+			// names it can't type, so detect the type from the downloaded bytes.
+			if ( '' === pathinfo( $name, PATHINFO_EXTENSION ) ) {
+				$mime_to_ext = array(
+					'image/jpeg' => 'jpg',
+					'image/png'  => 'png',
+					'image/gif'  => 'gif',
+					'image/webp' => 'webp',
+				);
+				$mime = wp_get_image_mime( $tmp );
+				if ( isset( $mime_to_ext[ $mime ] ) ) {
+					$name .= '.' . $mime_to_ext[ $mime ];
+				}
+			}
 		} else {
 			if ( ! is_readable( $src ) ) {
 				PMS_Logger::error( 'Image file not readable: ' . $src );

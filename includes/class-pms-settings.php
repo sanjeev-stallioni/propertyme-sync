@@ -60,6 +60,8 @@ class PMS_Settings {
 			'redirect_uri'       => esc_url_raw( $input['redirect_uri'] ?? home_url( '/home/callback' ) ),
 			'sync_interval'      => in_array( $input['sync_interval'] ?? '', array( 'pms_6h', 'pms_8h', 'pms_12h' ), true ) ? $input['sync_interval'] : 'pms_12h',
 			'sync_enabled'       => empty( $input['sync_enabled'] ) ? 0 : 1,
+			'feed_dir'           => self::sanitize_feed_dir( $input['feed_dir'] ?? '' ),
+			'layout_template'    => self::sanitize_layout_template( $input['layout_template'] ?? 0 ),
 		);
 
 		// Blank secret field means "keep the stored one"; a value is encrypted.
@@ -85,6 +87,57 @@ class PMS_Settings {
 	 * legacy string too (normalising "offline access" typos). Falls back to
 	 * all documented scopes when nothing valid remains.
 	 */
+	/**
+	 * Drop directory: a path relative to ABSPATH ('' = site root).
+	 *
+	 * Refuses absolute paths, traversal and anything resolving outside the
+	 * WordPress install, and keeps the previous value (with an admin notice)
+	 * rather than silently falling back to a directory the admin didn't pick.
+	 */
+	private static function sanitize_feed_dir( $value ) {
+		$value = str_replace( '\\', '/', (string) $value );
+		$value = trim( wp_unslash( $value ) );
+		$value = trim( $value, "/ \t\n\r\0\x0B" );
+		// Strip anything that isn't a plausible path character.
+		$value = preg_replace( '#[^A-Za-z0-9_./\- ]#', '', $value );
+
+		if ( '' !== $value && '' === PMS_REAXML::resolve_dir( $value, true ) ) {
+			$current = pms_get_settings();
+			add_settings_error(
+				'pms_settings',
+				'pms_feed_dir',
+				'REAXML drop directory was not changed: that path is not a readable folder inside the WordPress installation.',
+				'error'
+			);
+			return isset( $current['feed_dir'] ) ? $current['feed_dir'] : '';
+		}
+		return $value;
+	}
+
+	/**
+	 * Detail-page template: 0 (auto-detect) or the id of a post/template that
+	 * actually holds Elementor data. Anything else is refused rather than
+	 * stored, so the sync can't be pointed at an empty layout.
+	 */
+	private static function sanitize_layout_template( $value ) {
+		$id = (int) $value;
+		if ( $id <= 0 ) {
+			return 0;
+		}
+		$layout = get_post_meta( $id, '_elementor_data', true );
+		if ( ! $layout || ! is_string( $layout ) ) {
+			add_settings_error(
+				'pms_settings',
+				'pms_layout_template',
+				'Detail page template was not changed: the selected item has no Elementor layout.',
+				'error'
+			);
+			$current = pms_get_settings();
+			return isset( $current['layout_template'] ) ? (int) $current['layout_template'] : 0;
+		}
+		return $id;
+	}
+
 	private static function sanitize_scope( $scope ) {
 		if ( is_string( $scope ) ) {
 			$scope = preg_split( '/\s+/', str_replace( 'offline access', 'offline_access', $scope ) );
@@ -278,16 +331,78 @@ class PMS_Settings {
 							</select>
 						</td>
 					</tr>
+					<tr>
+						<th scope="row"><label for="pms_feed_dir">REAXML drop directory</label></th>
+						<td>
+							<?php
+							$feed_rel = isset( $s['feed_dir'] ) ? $s['feed_dir'] : '';
+							$feed_abs = PMS_REAXML::resolve_dir( $feed_rel, false );
+							$feed_ok  = '' !== $feed_abs;
+							$pending  = $feed_ok ? count( glob( $feed_abs . '/*.[xX][mM][lL]' ) ?: array() ) : 0;
+							?>
+							<code><?php echo esc_html( trailingslashit( ABSPATH ) ); ?></code>
+							<input name="pms_settings[feed_dir]" id="pms_feed_dir" type="text" class="regular-text" value="<?php echo esc_attr( $feed_rel ); ?>" placeholder="(site root)">
+							<p class="description">
+								Folder PropertyMe's FTP delivers REAXML listing files into, relative to the WordPress root.
+								Leave <strong>empty</strong> for the site root — that is where PropertyMe delivers on the live site.
+								Imported files are moved out to <code>uploads/propertyme-feed/processed/</code>.
+								<?php if ( $feed_ok ) : ?>
+									<br><span style="color:#008a20">&#10003; Valid:</span> <code><?php echo esc_html( $feed_abs ); ?></code>
+									&mdash; <?php echo (int) $pending; ?> XML file(s) currently in the folder.
+								<?php else : ?>
+									<br><span style="color:#d63638">&#10007; Not a readable folder inside the WordPress install.</span>
+								<?php endif; ?>
+							</p>
+						</td>
+					</tr>
+					<tr>
+						<th scope="row"><label for="pms_layout_template">Detail page template</label></th>
+						<td>
+							<?php
+							$chosen   = isset( $s['layout_template'] ) ? (int) $s['layout_template'] : 0;
+							$resolved = PMS_Sync::layout_template_id();
+							?>
+							<select name="pms_settings[layout_template]" id="pms_layout_template">
+								<option value="0" <?php selected( $chosen, 0 ); ?>>Automatic (use an existing property page)</option>
+								<?php foreach ( PMS_Sync::layout_template_choices() as $id => $label ) : ?>
+									<option value="<?php echo (int) $id; ?>" <?php selected( $chosen, (int) $id ); ?>><?php echo esc_html( $label ); ?></option>
+								<?php endforeach; ?>
+							</select>
+							<p class="description">
+								The Elementor layout copied onto <strong>newly created</strong> property pages so they match the site's design.
+								Property pages that already have their own layout are never overwritten.
+								<?php if ( $resolved ) : ?>
+									<br>Currently using: <strong><?php echo esc_html( get_the_title( $resolved ) ); ?></strong> (#<?php echo (int) $resolved; ?>)
+								<?php else : ?>
+									<br><span style="color:#d63638">No usable layout found — new property pages will have no detail design.</span>
+								<?php endif; ?>
+							</p>
+						</td>
+					</tr>
 				</table>
 
 				<?php submit_button( 'Save settings' ); ?>
 			</form>
 
-			<h2 class="title">Recent log</h2>
+			<?php
+			$log_level  = isset( $_GET['pms_log_level'] ) && 'error' === $_GET['pms_log_level'] ? 'error' : '';
+			$log_errors = PMS_Logger::count( 'error' );
+			$log_total  = PMS_Logger::count();
+			$base_url   = admin_url( 'options-general.php?page=propertyme-sync' );
+			?>
+			<h2 class="title">
+				Recent log
+				<span style="font-weight:400;font-size:13px">
+					&mdash;
+					<a href="<?php echo esc_url( $base_url ); ?>"<?php echo '' === $log_level ? ' style="font-weight:600"' : ''; ?>>All (<?php echo (int) $log_total; ?>)</a>
+					|
+					<a href="<?php echo esc_url( add_query_arg( 'pms_log_level', 'error', $base_url ) ); ?>"<?php echo 'error' === $log_level ? ' style="font-weight:600"' : ''; ?>>Errors (<?php echo (int) $log_errors; ?>)</a>
+				</span>
+			</h2>
 			<table class="widefat striped">
 				<thead><tr><th style="width:160px">Time</th><th style="width:70px">Level</th><th>Message</th></tr></thead>
 				<tbody>
-				<?php $rows = PMS_Logger::tail( 30 ); ?>
+				<?php $rows = PMS_Logger::tail( 30, $log_level ); ?>
 				<?php if ( ! $rows ) : ?>
 					<tr><td colspan="3">No log entries yet.</td></tr>
 				<?php else : foreach ( $rows as $row ) : ?>

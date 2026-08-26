@@ -10,12 +10,17 @@ defined( 'ABSPATH' ) || exit;
  */
 class PMS_DB {
 
-	const DB_VERSION        = '1.0';
+	const DB_VERSION        = '1.1'; // 1.1: added the pms_log table
 	const DB_VERSION_OPTION = 'pms_db_version';
 
 	public static function table() {
 		global $wpdb;
 		return $wpdb->prefix . 'pms_properties';
+	}
+
+	public static function log_table() {
+		global $wpdb;
+		return $wpdb->prefix . 'pms_log';
 	}
 
 	/** Create/upgrade the table. Safe to call repeatedly (dbDelta diffs schema). */
@@ -52,6 +57,18 @@ class PMS_DB {
 			KEY listing_status (listing_status)
 		) {$charset};" );
 
+		$log_table = self::log_table();
+		dbDelta( "CREATE TABLE {$log_table} (
+			id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			logged_at DATETIME NOT NULL,
+			level VARCHAR(20) NOT NULL DEFAULT 'info',
+			message TEXT NOT NULL,
+			context LONGTEXT NULL,
+			PRIMARY KEY  (id),
+			KEY logged_at (logged_at),
+			KEY level (level)
+		) {$charset};" );
+
 		update_option( self::DB_VERSION_OPTION, self::DB_VERSION );
 	}
 
@@ -59,6 +76,7 @@ class PMS_DB {
 	public static function maybe_upgrade() {
 		if ( get_option( self::DB_VERSION_OPTION ) !== self::DB_VERSION ) {
 			self::install();
+			PMS_Logger::migrate_from_option();
 		}
 	}
 
@@ -113,6 +131,7 @@ class PMS_DB {
 	public static function drop() {
 		global $wpdb;
 		$wpdb->query( 'DROP TABLE IF EXISTS ' . self::table() );
+		$wpdb->query( 'DROP TABLE IF EXISTS ' . self::log_table() );
 		delete_option( self::DB_VERSION_OPTION );
 	}
 }

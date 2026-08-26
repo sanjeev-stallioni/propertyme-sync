@@ -4,6 +4,7 @@ defined( 'WP_UNINSTALL_PLUGIN' ) || exit;
 
 global $wpdb;
 $wpdb->query( 'DROP TABLE IF EXISTS ' . $wpdb->prefix . 'pms_properties' );
+$wpdb->query( 'DROP TABLE IF EXISTS ' . $wpdb->prefix . 'pms_log' );
 
 delete_option( 'pms_settings' );
 delete_option( 'pms_db_version' );

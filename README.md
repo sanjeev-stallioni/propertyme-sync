@@ -40,8 +40,8 @@ No third-party plugin APIs are used anywhere: storage is `$wpdb`/`dbDelta`, fiel
   - API images (`lots/{id}/images`) imported per lot when present
   - **REA XML importer**: drop realestate.com.au-format feed files into `uploads/propertyme-feed/` (auto-created); imports photos (`url=` or `file=` alongside the XML), floorplans, listing descriptions, and inspection times; files archived to `processed/`; hash-based dedupe prevents re-imports
   - Featured image + gallery field + floorplan file field populated
-- **Detail-page layout cloning** — new posts receive the site's per-post Elementor layout from a designated template post (all widgets dynamic-tag bound); posts with their own layout are never touched
-- **Logging** — ring-buffer log on the settings page, including a raw sample of the first lot each sync for mapping verification
+- **Detail-page layout** — prefers an Elementor **Theme Builder** "Single" template whose display condition covers property posts: Elementor renders every property from that one template, so nothing is stored per post and a design change reaches all properties at once. If no such template applies, the plugin falls back to cloning a layout (chosen in Settings, or auto-detected) onto the new post so properties are never left unstyled. Posts with their own layout are never touched.
+- **Logging** — activity log in the plugin's own `wp_pms_log` table (never autoloaded, capped at 1000 rows, All/Errors filter on the settings page), including a raw sample of the first lot each sync for mapping verification
 - **Clean uninstall** — custom table, settings, tokens, and logs removed
 
 ## Requirements
@@ -65,22 +65,25 @@ No third-party plugin APIs are used anywhere: storage is `$wpdb`/`dbDelta`, fiel
 
 ## REA XML feeds
 
-Place feed files (and any photos they reference by `file=`) in `wp-content/uploads/propertyme-feed/`, then click **Import REA XML now** — the import also runs automatically after each scheduled sync. Listings are matched to posts by previously imported unique id → PropertyMe lot id → street address. Override the drop directory with the `pms_reaxml_dir` filter.
+PropertyMe delivers one REAXML file per listing by FTP, typically into the **site root**. Set **Settings → PropertyMe Sync → REAXML drop directory** to that folder (path relative to the WordPress root; leave empty for the site root), then click **Import REA XML now** — the import also runs automatically after each scheduled sync. Listings are matched to posts by previously imported unique id → PropertyMe lot id → street address.
+
+Because that directory is usually public and holds unrelated files, the importer only touches files matching PropertyMe's `{id}-{timestamp}.xml` naming *and* containing a `<propertyList>` listing; each file is moved out of the public directory into `uploads/propertyme-feed/processed/` (deny-listed via `.htaccess`) **before** parsing, and XML is parsed with `LIBXML_NONET`. The directory is validated to sit inside the WordPress install. Override programmatically with the `pms_reaxml_dir` filter.
 
 ## Data storage
 
 | Location | Contents |
 |---|---|
 | `wp_pms_properties` (custom table) | One row per lot: normalized columns + full raw JSON + linked post ID + timestamps |
-| `wp_options` | `pms_settings` (secret encrypted), `pms_tokens` (encrypted), `pms_log`, `pms_last_sync`, `pms_db_version`, `pms_layout_template_post` |
-| `wp_posts` / `wp_postmeta` | The projected content the theme renders; sync markers `_pms_lot_id`, `_pms_synced_at`, `_pms_rea_unique_id`, `_pms_src` (attachment dedupe) |
+| `wp_pms_log` (custom table) | Activity log: one row per entry (time, level, message, JSON context), pruned to the newest 1000 |
+| `wp_options` | `pms_settings` (secret encrypted; includes `feed_dir` and `layout_template`), `pms_tokens` (encrypted), `pms_last_sync`, `pms_db_version`, legacy `pms_layout_template_post` |
+| `wp_posts` / `wp_postmeta` | The projected content the theme renders; sync markers `_pms_lot_id`, `_pms_synced_at`, `_pms_rea_unique_id`, `_pms_src` (attachment dedupe), `_pms_layout_backup` (pre-Theme-Builder layout, kept for rollback) |
 
 ## Site-specific configuration
 
 This plugin was built against one site's data model and needs adapting for reuse:
 
 - **Field keys** — `PMS_Sync::PROPERTY_FIELDS` maps field names to that site's ACF field keys. Point these at your own field group.
-- **Layout template** — the `pms_layout_template_post` option holds the post ID whose Elementor layout is cloned onto new properties.
+- **Detail-page design** — preferred: an Elementor Theme Builder *Single* template conditioned on your property posts (nothing to configure in the plugin). Otherwise pick a clone source under **Settings → PropertyMe Sync → Detail page template**.
 - **Post types** — properties are regular posts; agents are an `agents` custom post type.
 - **Status field** — the listing filter reads a `leased_type` meta field with values `For Lease` / `Leased`.
 

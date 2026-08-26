@@ -43,6 +43,11 @@ function pms_get_settings() {
 		'redirect_uri'       => home_url( '/home/callback' ),
 		'sync_interval'      => 'pms_12h',
 		'sync_enabled'       => 0,
+		// Where PropertyMe's FTP delivers REAXML files, relative to ABSPATH.
+		// '' = site root (PropertyMe's actual delivery target on live).
+		'feed_dir'           => 'wp-content/uploads/propertyme-feed',
+		// Elementor layout cloned onto new property posts (0 = auto-detect).
+		'layout_template'    => 0,
 	);
 	$saved = get_option( 'pms_settings', array() );
 	$s     = wp_parse_args( is_array( $saved ) ? $saved : array(), $defaults );

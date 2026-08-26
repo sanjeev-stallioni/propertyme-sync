@@ -102,14 +102,18 @@ class PMS_Sync {
 	}
 
 	/**
-	 * Photos from the API: GET lots/{id}/images per synced lot. Currently
-	 * every portfolio lot returns [] (no photos uploaded in the CRM), so
-	 * this is a no-op until they appear; REA XML is the main photo source.
+	 * Photos from the API: GET lots/{id}/images per synced lot. The endpoint
+	 * returns document METADATA only (no URL); the file itself lives behind
+	 * manager.propertyme.com/api/storage/images/{id}, which rejects public-API
+	 * bearer tokens (session auth only, verified 2026-08-24). So property-card
+	 * photos cannot be fetched by integrations — REA XML is the photo source.
+	 * The URL-key scan below stays in case PropertyMe ever adds a URL field.
 	 */
 	public static function sync_api_images() {
 		global $wpdb;
 		$rows     = $wpdb->get_results( 'SELECT lot_id, post_id FROM ' . PMS_DB::table() . ' WHERE post_id > 0', ARRAY_A );
 		$imported = 0;
+		$metadata_only_noted = false;
 		foreach ( (array) $rows as $row ) {
 			$images = PMS_API::get( 'lots/' . $row['lot_id'] . '/images' );
 			if ( is_wp_error( $images ) || empty( $images ) || ! is_array( $images ) ) {
@@ -128,7 +132,10 @@ class PMS_Sync {
 					}
 				}
 				if ( '' === $url ) {
-					PMS_Logger::info( 'API image with no recognisable URL key — raw sample logged.', $image );
+					if ( ! $metadata_only_noted ) {
+						$metadata_only_noted = true;
+						PMS_Logger::info( 'Lot photos exist in the CRM but the API exposes metadata only (no download URL) — photos sync via REA XML instead. Sample logged.', $image );
+					}
 					continue;
 				}
 				$att = PMS_Media::import( (int) $row['post_id'], $url, (string) ( $image['UpdatedOn'] ?? ( $image['Id'] ?? '' ) ) );
@@ -385,20 +392,161 @@ class PMS_Sync {
 	}
 
 	/**
-	 * Property detail pages are per-post Elementor layouts whose widgets are
-	 * all bound to dynamic tags (ACF gallery carousel, field headings,
-	 * agent card, map, enquiry form). New synced posts get a copy of the
-	 * layout from a designated template post so they render identically;
-	 * posts that already have their own Elementor data are left untouched.
+	 * The Elementor layout to clone onto new property posts.
+	 *
+	 * Preference order:
+	 *   1. the template chosen in Settings → PropertyMe Sync
+	 *   2. the legacy pms_layout_template_post option (pre-1.1 installs)
+	 *   3. any existing property post that already has a layout
+	 *
+	 * Step 3 means a deleted or re-created template can't silently leave new
+	 * properties unstyled; nothing is hardcoded to a specific post id.
+	 *
+	 * @return int Template/post id, or 0 when no usable layout exists.
+	 */
+	public static function layout_template_id() {
+		$candidates = array();
+
+		$s = pms_get_settings();
+		if ( ! empty( $s['layout_template'] ) ) {
+			$candidates[] = (int) $s['layout_template'];
+		}
+		$legacy = (int) get_option( 'pms_layout_template_post', 0 );
+		if ( $legacy ) {
+			$candidates[] = $legacy;
+		}
+
+		foreach ( $candidates as $id ) {
+			$layout = get_post_meta( $id, '_elementor_data', true );
+			if ( $layout && is_string( $layout ) && get_post_status( $id ) ) {
+				return $id;
+			}
+		}
+
+		// Last resort: an already-synced property that carries a layout.
+		global $wpdb;
+		$found = (int) $wpdb->get_var(
+			"SELECT p.ID FROM {$wpdb->posts} p
+			 INNER JOIN {$wpdb->postmeta} d ON d.post_id = p.ID AND d.meta_key = '_elementor_data' AND d.meta_value != ''
+			 INNER JOIN {$wpdb->postmeta} l ON l.post_id = p.ID AND l.meta_key = '_pms_lot_id'
+			 WHERE p.post_type = 'post' AND p.post_status = 'publish'
+			 ORDER BY p.ID ASC LIMIT 1"
+		);
+		return $found;
+	}
+
+	/**
+	 * Is an Elementor Theme Builder "single" template configured to render
+	 * property posts? If so, per-post layouts are unnecessary.
+	 *
+	 * Checked against the stored Theme Builder conditions rather than by
+	 * running Elementor's resolver, which needs a full front-end query loop
+	 * that isn't available during a cron sync.
+	 *
+	 * @param int $post_id Property post the template would apply to.
+	 */
+	public static function has_theme_builder_template( $post_id ) {
+		$conditions = get_option( 'elementor_pro_theme_builder_conditions', array() );
+		if ( empty( $conditions['single'] ) || ! is_array( $conditions['single'] ) ) {
+			return false;
+		}
+
+		$categories = wp_get_post_categories( $post_id );
+
+		foreach ( $conditions['single'] as $template_id => $rules ) {
+			if ( ! get_post_meta( $template_id, '_elementor_data', true ) || 'publish' !== get_post_status( $template_id ) ) {
+				continue;
+			}
+			foreach ( (array) $rules as $rule ) {
+				// Rules look like include/singular/post, include/singular/post/category/101,
+				// include/singular/post/<id>; exclusions are ignored deliberately —
+				// a false negative only means a harmless per-post clone.
+				if ( 0 !== strpos( $rule, 'include/singular/post' ) ) {
+					continue;
+				}
+				$suffix = trim( substr( $rule, strlen( 'include/singular/post' ) ), '/' );
+				if ( '' === $suffix ) {
+					return true; // all posts
+				}
+				if ( (string) $post_id === $suffix ) {
+					return true; // this exact post
+				}
+				if ( 0 === strpos( $suffix, 'category/' ) ) {
+					$term_id = (int) substr( $suffix, strlen( 'category/' ) );
+					if ( $term_id && in_array( $term_id, $categories, true ) ) {
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	/** Elementor saved templates + property posts that can act as a layout source. */
+	public static function layout_template_choices() {
+		$choices = array();
+
+		// Only full-page template types make sense as a detail-page layout —
+		// headers, popups, widgets and sections would render nonsense.
+		$page_types = array( 'page', 'single', 'single-post', 'single-page', 'wp-page', 'wp-post' );
+		foreach ( get_posts( array(
+			'post_type'      => 'elementor_library',
+			'post_status'    => 'publish',
+			'posts_per_page' => 100,
+			'orderby'        => 'title',
+			'order'          => 'ASC',
+		) ) as $tpl ) {
+			$type = get_post_meta( $tpl->ID, '_elementor_template_type', true );
+			if ( ! in_array( $type, $page_types, true ) ) {
+				continue;
+			}
+			if ( get_post_meta( $tpl->ID, '_elementor_data', true ) ) {
+				$choices[ $tpl->ID ] = 'Template: ' . $tpl->post_title . ( $type ? ' (' . $type . ')' : '' );
+			}
+		}
+
+		global $wpdb;
+		$property_ids = $wpdb->get_col(
+			"SELECT p.ID FROM {$wpdb->posts} p
+			 INNER JOIN {$wpdb->postmeta} d ON d.post_id = p.ID AND d.meta_key = '_elementor_data' AND d.meta_value != ''
+			 WHERE p.post_type = 'post' AND p.post_status = 'publish'
+			 ORDER BY p.post_title ASC LIMIT 100"
+		);
+		foreach ( $property_ids as $pid ) {
+			$choices[ (int) $pid ] = 'Property page: ' . get_the_title( $pid );
+		}
+
+		return $choices;
+	}
+
+	/**
+	 * Give a new property post its detail-page design.
+	 *
+	 * Preferred setup is an Elementor Theme Builder "Single" template whose
+	 * display condition covers property posts: Elementor then renders every
+	 * property from that one template, so nothing is copied per post and a
+	 * design change reaches all properties at once. When such a template is
+	 * active this does nothing.
+	 *
+	 * The per-post clone below is the fallback for sites without one (or if
+	 * the condition is ever removed), so properties are never left unstyled.
+	 * Posts that already carry their own layout are never overwritten.
 	 */
 	private static function ensure_elementor_layout( $post_id ) {
 		if ( get_post_meta( $post_id, '_elementor_data', true ) ) {
 			return;
 		}
-		$template_id = (int) get_option( 'pms_layout_template_post', 991956 ); // site's designated template property post
-		$layout      = get_post_meta( $template_id, '_elementor_data', true );
+		if ( self::has_theme_builder_template( $post_id ) ) {
+			return;
+		}
+		$template_id = self::layout_template_id();
+		if ( ! $template_id ) {
+			PMS_Logger::error( 'No detail-page template is available — layout not applied to post ' . $post_id . '. Choose one in Settings → PropertyMe Sync.' );
+			return;
+		}
+		$layout = get_post_meta( $template_id, '_elementor_data', true );
 		if ( ! $layout || ! is_string( $layout ) ) {
-			PMS_Logger::error( 'Layout template post ' . $template_id . ' has no Elementor data — detail layout not applied to post ' . $post_id . '.' );
+			PMS_Logger::error( 'Detail-page template ' . $template_id . ' has no Elementor data — layout not applied to post ' . $post_id . '.' );
 			return;
 		}
 		update_post_meta( $post_id, '_elementor_data', wp_slash( $layout ) );
