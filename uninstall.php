@@ -12,4 +12,6 @@ delete_option( 'pms_tokens' );
 delete_option( 'pms_oauth_state' );
 delete_option( 'pms_log' );
 delete_option( 'pms_last_sync' );
+delete_option( 'pms_delta_cursor' );
+delete_option( 'pms_delta_runs' );
 wp_clear_scheduled_hook( 'pms_sync_event' );

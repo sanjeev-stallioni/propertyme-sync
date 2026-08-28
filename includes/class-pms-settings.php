@@ -12,18 +12,55 @@ class PMS_Settings {
 
 	const PAGE = 'propertyme-sync';
 
-	/** The scopes PropertyMe documents for this integration. */
+	/**
+	 * The scopes this integration actually needs.
+	 *
+	 * Only two endpoints are ever called — /lots (property:read) and
+	 * /members (contact:read) — so the activity,
+	 * communication and transaction scopes PropertyMe also documents are
+	 * deliberately not requested: they would grant access to activity feeds,
+	 * messages and financial transactions (tenant ledgers, owner statements,
+	 * rent payments) that the website has no use for. Removed 2026-08-28;
+	 * see maybe_migrate_scope() for the upgrade path.
+	 */
 	const SCOPES = array(
-		'activity:read'      => 'Activity (read)',
-		'communication:read' => 'Communication (read)',
-		'contact:read'       => 'Contact (read)',
-		'property:read'      => 'Property (read)',
-		'transaction:read'   => 'Transaction (read)',
-		'offline_access'     => 'Offline access — refresh token for unattended syncs',
+		'contact:read'   => 'Contact (read) — agent name, email, phone, job title',
+		'property:read'  => 'Property (read) — the properties themselves',
+		'offline_access' => 'Offline access — refresh token for unattended syncs',
 	);
+
+	/** Scopes previously requested that are no longer used. */
+	const RETIRED_SCOPES = array( 'activity:read', 'communication:read', 'transaction:read' );
+
+	/**
+	 * Drop retired scopes from a value saved by an earlier version.
+	 *
+	 * Without this the stored option keeps asking for permissions the plugin
+	 * never uses until someone happens to re-save the settings page. Narrowing
+	 * the request does not invalidate the existing token — it only applies to
+	 * the next authorisation — so no reconnect is forced.
+	 */
+	public static function maybe_migrate_scope() {
+		$saved = get_option( 'pms_settings', array() );
+		if ( ! is_array( $saved ) || empty( $saved['scope'] ) || ! is_string( $saved['scope'] ) ) {
+			return;
+		}
+		$current = preg_split( '/\s+/', trim( $saved['scope'] ) );
+		$cleaned = array_values( array_diff( $current, self::RETIRED_SCOPES ) );
+		if ( count( $cleaned ) === count( $current ) ) {
+			return;
+		}
+		$saved['scope'] = implode( ' ', $cleaned );
+		update_option( 'pms_settings', $saved );
+		PMS_Logger::info( sprintf(
+			'Removed unused API permissions (%s) from the saved settings — the website only reads properties and staff contact details. The existing connection is unaffected; the narrower set applies next time PropertyMe access is approved.',
+			implode( ', ', self::RETIRED_SCOPES )
+		) );
+	}
 
 	public static function init() {
 		add_action( 'admin_menu', array( __CLASS__, 'menu' ) );
+		add_action( 'admin_init', array( __CLASS__, 'maybe_migrate_scope' ) );
 		add_action( 'admin_init', array( __CLASS__, 'register' ) );
 		add_action( 'admin_post_pms_connect', array( __CLASS__, 'handle_connect' ) );
 		add_action( 'admin_post_pms_disconnect', array( __CLASS__, 'handle_disconnect' ) );
@@ -58,8 +95,9 @@ class PMS_Settings {
 			'api_base'           => untrailingslashit( esc_url_raw( $input['api_base'] ?? '' ) ),
 			'scope'              => self::sanitize_scope( $input['scope'] ?? array() ),
 			'redirect_uri'       => esc_url_raw( $input['redirect_uri'] ?? home_url( '/home/callback' ) ),
-			'sync_interval'      => in_array( $input['sync_interval'] ?? '', array( 'pms_6h', 'pms_8h', 'pms_12h' ), true ) ? $input['sync_interval'] : 'pms_12h',
+			'sync_interval'      => in_array( $input['sync_interval'] ?? '', array( 'pms_5min', 'pms_6h', 'pms_8h', 'pms_12h' ), true ) ? $input['sync_interval'] : 'pms_12h',
 			'sync_enabled'       => empty( $input['sync_enabled'] ) ? 0 : 1,
+			'delta_sync'         => empty( $input['delta_sync'] ) ? 0 : 1,
 			'feed_dir'           => self::sanitize_feed_dir( $input['feed_dir'] ?? '' ),
 			'layout_template'    => self::sanitize_layout_template( $input['layout_template'] ?? 0 ),
 		);
@@ -167,6 +205,10 @@ class PMS_Settings {
 		current_user_can( 'manage_options' ) || wp_die( 'Forbidden' );
 		check_admin_referer( 'pms_disconnect' );
 		PMS_OAuth::disconnect();
+		// Drop the incremental cursor: a reconnect (possibly to a different
+		// portfolio) must start from a full read, not skip everything older.
+		delete_option( PMS_Sync::DELTA_OPTION );
+		delete_option( 'pms_delta_runs' );
 		wp_safe_redirect( add_query_arg( 'pms_status', 'disconnected', self::url() ) );
 		exit;
 	}
@@ -325,10 +367,37 @@ class PMS_Settings {
 						<th scope="row"><label for="pms_interval">Interval</label></th>
 						<td>
 							<select name="pms_settings[sync_interval]" id="pms_interval">
+								<?php // TESTING ONLY — remove this option before release. ?>
+								<option value="pms_5min" <?php selected( $s['sync_interval'], 'pms_5min' ); ?>>Every 5 minutes (testing only)</option>
 								<option value="pms_6h" <?php selected( $s['sync_interval'], 'pms_6h' ); ?>>Every 6 hours</option>
 								<option value="pms_8h" <?php selected( $s['sync_interval'], 'pms_8h' ); ?>>Every 8 hours</option>
 								<option value="pms_12h" <?php selected( $s['sync_interval'], 'pms_12h' ); ?>>Every 12 hours</option>
 							</select>
+						</td>
+					</tr>
+					<tr>
+						<th scope="row">Incremental sync</th>
+						<td>
+							<label><input name="pms_settings[delta_sync]" type="checkbox" value="1" <?php checked( $s['delta_sync'] ); ?>> Fetch only properties changed since the last sync</label>
+							<p class="description">
+								Faster, and lighter on PropertyMe. A full check still runs every
+								<?php echo (int) PMS_Sync::FULL_SWEEP_EVERY; ?> syncs so archived
+								properties are still picked up. Turn this off to read every
+								property on every sync.
+								<?php
+								$cursor = get_option( PMS_Sync::DELTA_OPTION, '' );
+								$runs   = (int) get_option( 'pms_delta_runs', 0 );
+								if ( $cursor ) {
+									printf(
+										'<br>Next full check in %d sync%s.',
+										max( 0, PMS_Sync::FULL_SWEEP_EVERY - $runs ),
+										1 === max( 0, PMS_Sync::FULL_SWEEP_EVERY - $runs ) ? '' : 's'
+									);
+								} else {
+									echo '<br>The next sync will read every property.';
+								}
+								?>
+							</p>
 						</td>
 					</tr>
 					<tr>

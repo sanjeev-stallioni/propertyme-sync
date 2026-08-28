@@ -39,7 +39,7 @@ function pms_get_settings() {
 		'authorize_endpoint' => 'https://login.propertyme.com/connect/authorize',
 		'token_endpoint'     => 'https://login.propertyme.com/connect/token',
 		'api_base'           => 'https://app.propertyme.com/api/v1',
-		'scope'              => 'activity:read communication:read contact:read property:read transaction:read offline_access',
+		'scope'              => 'contact:read property:read offline_access',
 		'redirect_uri'       => home_url( '/home/callback' ),
 		'sync_interval'      => 'pms_12h',
 		'sync_enabled'       => 0,
@@ -48,6 +48,9 @@ function pms_get_settings() {
 		'feed_dir'           => 'wp-content/uploads/propertyme-feed',
 		// Elementor layout cloned onto new property posts (0 = auto-detect).
 		'layout_template'    => 0,
+		// Fetch only lots changed since the last run (API "Timestamp" param).
+		// A full sweep still runs periodically — see PMS_Sync::sync_properties().
+		'delta_sync'         => 1,
 	);
 	$saved = get_option( 'pms_settings', array() );
 	$s     = wp_parse_args( is_array( $saved ) ? $saved : array(), $defaults );

@@ -27,6 +27,13 @@ class PMS_Sync {
 	const CRON_HOOK = 'pms_sync_event';
 
 	/** Field name => field key reference (from the existing "Property" field group). */
+	/** ACF field keys on the agents CPT (additional_fields group). */
+	const AGENT_FIELDS = array(
+		'title'         => 'field_6a06bc42bdc14',
+		'phone_number'  => 'field_6a06bc55bdc15',
+		'email_address' => 'field_6a06bc76bdc16',
+	);
+
 	const PROPERTY_FIELDS = array(
 		'property_type'        => 'field_69e84daef2fad',
 		'leased_type'          => 'field_6a0667a78bde6',
@@ -54,6 +61,9 @@ class PMS_Sync {
 	}
 
 	public static function cron_schedules( $schedules ) {
+		// TESTING ONLY — remove before release. Lets a full cron cycle be
+		// observed in minutes instead of hours; far too frequent for live use.
+		$schedules['pms_5min'] = array( 'interval' => 5 * MINUTE_IN_SECONDS, 'display' => 'Every 5 minutes (PropertyMe — TESTING ONLY)' );
 		$schedules['pms_6h']  = array( 'interval' => 6 * HOUR_IN_SECONDS,  'display' => 'Every 6 hours (PropertyMe)' );
 		$schedules['pms_8h']  = array( 'interval' => 8 * HOUR_IN_SECONDS,  'display' => 'Every 8 hours (PropertyMe)' );
 		$schedules['pms_12h'] = array( 'interval' => 12 * HOUR_IN_SECONDS, 'display' => 'Every 12 hours (PropertyMe)' );
@@ -89,8 +99,12 @@ class PMS_Sync {
 		PMS_Logger::info( 'Sync started.' );
 
 		try {
-			$counts           = self::sync_properties();
-			$counts['photos'] = self::sync_api_images();
+			// Photos come from REAXML only. The API cannot supply them:
+			// /v1/lots/{Id}/images returns document metadata with no URL of
+			// any kind, and the file itself is served from a host that accepts
+			// only a browser login session, never an API token. Confirmed
+			// 2026-08-28 against a real uploaded photo — see PROJECT-STATUS.md.
+			$counts = self::sync_properties();
 			update_option( 'pms_last_sync', current_time( 'mysql' ), false );
 			PMS_Logger::info( 'Sync finished.', $counts );
 			PMS_REAXML::import_dir();
@@ -102,57 +116,53 @@ class PMS_Sync {
 	}
 
 	/**
-	 * Photos from the API: GET lots/{id}/images per synced lot. The endpoint
-	 * returns document METADATA only (no URL); the file itself lives behind
-	 * manager.propertyme.com/api/storage/images/{id}, which rejects public-API
-	 * bearer tokens (session auth only, verified 2026-08-24). So property-card
-	 * photos cannot be fetched by integrations — REA XML is the photo source.
-	 * The URL-key scan below stays in case PropertyMe ever adds a URL field.
+	 * Highest lot Timestamp seen so far. PropertyMe's Timestamp is an opaque
+	 * ascending int64 (not a date), and /v1/lots?Timestamp=N returns only lots
+	 * with a value strictly greater than N — so storing the maximum we have
+	 * seen and passing it back is an exact "what changed since" cursor.
 	 */
-	public static function sync_api_images() {
-		global $wpdb;
-		$rows     = $wpdb->get_results( 'SELECT lot_id, post_id FROM ' . PMS_DB::table() . ' WHERE post_id > 0', ARRAY_A );
-		$imported = 0;
-		$metadata_only_noted = false;
-		foreach ( (array) $rows as $row ) {
-			$images = PMS_API::get( 'lots/' . $row['lot_id'] . '/images' );
-			if ( is_wp_error( $images ) || empty( $images ) || ! is_array( $images ) ) {
-				continue;
-			}
-			$ids = array();
-			foreach ( $images as $image ) {
-				if ( ! is_array( $image ) ) {
-					continue;
-				}
-				$url = '';
-				foreach ( array( 'Url', 'DownloadUrl', 'url', 'Uri', 'Href' ) as $key ) {
-					if ( ! empty( $image[ $key ] ) && is_string( $image[ $key ] ) ) {
-						$url = $image[ $key ];
-						break;
-					}
-				}
-				if ( '' === $url ) {
-					if ( ! $metadata_only_noted ) {
-						$metadata_only_noted = true;
-						PMS_Logger::info( 'Lot photos exist in the CRM but the API exposes metadata only (no download URL) — photos sync via REA XML instead. Sample logged.', $image );
-					}
-					continue;
-				}
-				$att = PMS_Media::import( (int) $row['post_id'], $url, (string) ( $image['UpdatedOn'] ?? ( $image['Id'] ?? '' ) ) );
-				if ( $att ) {
-					$ids[] = $att;
-				}
-			}
-			if ( $ids ) {
-				PMS_Media::apply_gallery( (int) $row['post_id'], $ids );
-				$imported += count( $ids );
-			}
-		}
-		return $imported;
-	}
+	const DELTA_OPTION = 'pms_delta_cursor';
 
+	/**
+	 * How many delta runs may pass before a full sweep is forced.
+	 *
+	 * A delta run cannot see a lot that has been ARCHIVED, because archiving
+	 * removes it from /v1/lots altogether rather than returning it with a
+	 * flag. Only a full listing reveals that a property has gone, so the
+	 * sweep is what keeps archived properties from lingering on the site.
+	 */
+	const FULL_SWEEP_EVERY = 8;
+
+	/**
+	 * Fetch lots and project them onto the site.
+	 *
+	 * Runs incrementally where possible: the API's Timestamp cursor means a
+	 * quiet portfolio costs one request returning nothing instead of a full
+	 * re-read of every property. Every FULL_SWEEP_EVERY-th run (and any run
+	 * with no stored cursor) fetches everything and reconciles removals.
+	 */
 	private static function sync_properties() {
-		$lots = PMS_API::get( 'lots' );
+		$settings = pms_get_settings();
+		$cursor   = (string) get_option( self::DELTA_OPTION, '' );
+		$runs     = (int) get_option( 'pms_delta_runs', 0 );
+
+		// A sweep is due when delta is switched off, nothing has been synced
+		// yet, or enough incremental runs have passed to re-check for removals.
+		$full = empty( $settings['delta_sync'] )
+			|| '' === $cursor
+			|| $runs >= self::FULL_SWEEP_EVERY;
+
+		$query = $full ? array() : array( 'Timestamp' => $cursor );
+		$lots  = PMS_API::get( 'lots', $query );
+
+		// A rejected cursor must never stall the sync — fall back to a sweep.
+		if ( is_wp_error( $lots ) && ! $full ) {
+			PMS_Logger::info( 'Incremental fetch failed (' . $lots->get_error_message() . ') — falling back to a full sync.' );
+			$full  = true;
+			$query = array();
+			$lots  = PMS_API::get( 'lots' );
+		}
+
 		if ( is_wp_error( $lots ) ) {
 			PMS_Logger::error( 'Fetching lots failed: ' . $lots->get_error_message() );
 			return array( 'error' => $lots->get_error_message() );
@@ -165,19 +175,43 @@ class PMS_Sync {
 				break;
 			}
 		}
-		if ( empty( $lots ) || ! is_array( $lots ) ) {
-			PMS_Logger::info( 'No lots returned by the API.' );
-			return array( 'lots' => 0 );
+		if ( ! is_array( $lots ) ) {
+			$lots = array();
+		}
+
+		update_option( 'pms_delta_runs', $full ? 0 : $runs + 1, false );
+
+		// Nothing changed since the cursor: the common case for a delta run.
+		if ( empty( $lots ) ) {
+			if ( $full ) {
+				PMS_Logger::info( 'No lots returned by the API.' );
+				return array( 'lots' => 0 );
+			}
+			return array( 'mode' => 'incremental', 'lots' => 0, 'changed' => 0 );
 		}
 
 		// Discovery aid: keep one raw sample so field mapping can be verified.
-		PMS_Logger::info( 'Raw sample of first lot (for mapping verification).', reset( $lots ) );
+		if ( $full ) {
+			PMS_Logger::info( 'Raw sample of first lot (for mapping verification).', reset( $lots ) );
+		}
 
 		$stored    = 0;
 		$projected = 0;
+		$seen      = array();
+		$high      = $cursor;
 		foreach ( $lots as $lot ) {
 			if ( ! is_array( $lot ) ) {
 				continue;
+			}
+			$lot_id = self::str( $lot['Id'] ?? '' );
+			if ( '' !== $lot_id ) {
+				$seen[] = $lot_id;
+			}
+			// Advance the cursor over every lot received, including archived
+			// and unusable ones — skipping them would re-fetch them forever.
+			$ts = $lot['Timestamp'] ?? null;
+			if ( is_numeric( $ts ) && self::ts_greater( (string) $ts, $high ) ) {
+				$high = (string) $ts;
 			}
 			$row_id = self::store_lot( $lot );
 			if ( $row_id ) {
@@ -187,7 +221,83 @@ class PMS_Sync {
 				}
 			}
 		}
-		return array( 'lots' => count( $lots ), 'stored' => $stored, 'projected' => $projected );
+
+		if ( '' !== $high && $high !== $cursor ) {
+			update_option( self::DELTA_OPTION, $high, false );
+		}
+
+		$counts = array(
+			'mode'      => $full ? 'full' : 'incremental',
+			'lots'      => count( $lots ),
+			'stored'    => $stored,
+			'projected' => $projected,
+		);
+
+		// Only a full listing proves a property is gone from PropertyMe.
+		if ( $full ) {
+			$counts['removed'] = self::reconcile_removed( $seen );
+		}
+
+		return $counts;
+	}
+
+	/**
+	 * Is timestamp $a greater than $b?
+	 *
+	 * PropertyMe's Timestamp is an 18-digit int64, which exceeds the exact
+	 * range of a PHP float on 32-bit builds and sits at the edge of it
+	 * everywhere else. Compare as digit strings (length first, then
+	 * lexically) so no precision is lost.
+	 */
+	private static function ts_greater( $a, $b ) {
+		if ( '' === $b ) {
+			return true;
+		}
+		$a = ltrim( $a, '0' );
+		$b = ltrim( $b, '0' );
+		if ( strlen( $a ) !== strlen( $b ) ) {
+			return strlen( $a ) > strlen( $b );
+		}
+		return strcmp( $a, $b ) > 0;
+	}
+
+	/**
+	 * Unpublish properties that PropertyMe no longer returns.
+	 *
+	 * Archiving a lot removes it from /v1/lots entirely, so a property that
+	 * has been archived (or deleted) would otherwise stay published on the
+	 * site forever. Posts are moved to draft rather than deleted: photos,
+	 * layout and any manual edits survive, and the client can restore or bin
+	 * them from wp-admin. Only posts this plugin created are touched.
+	 *
+	 * @param string[] $seen Lot ids present in a full API listing.
+	 */
+	private static function reconcile_removed( array $seen ) {
+		if ( empty( $seen ) ) {
+			return 0; // never unpublish on an empty/failed listing
+		}
+
+		global $wpdb;
+		$rows = $wpdb->get_results( 'SELECT lot_id, post_id FROM ' . PMS_DB::table() . ' WHERE post_id > 0', ARRAY_A );
+		$keep = array_flip( $seen );
+		$gone = 0;
+
+		foreach ( (array) $rows as $row ) {
+			if ( isset( $keep[ $row['lot_id'] ] ) ) {
+				continue;
+			}
+			$post_id = (int) $row['post_id'];
+			if ( ! $post_id || 'publish' !== get_post_status( $post_id ) ) {
+				continue;
+			}
+			wp_update_post( array( 'ID' => $post_id, 'post_status' => 'draft' ) );
+			$gone++;
+			PMS_Logger::info( sprintf(
+				'"%s" is no longer in PropertyMe (archived or removed) — moved to Draft so it no longer shows on the site. Nothing was deleted.',
+				get_the_title( $post_id )
+			) );
+		}
+		return $gone;
 	}
 
 	/* ---------- Stage 1: API payload → custom table ---------- */
@@ -246,50 +356,259 @@ class PMS_Sync {
 			'listing_status' => empty( $lot['Vacant'] ) ? 'leased' : 'for_lease',
 			'agent_name'     => self::str( $lot['ManagerName'] ?? '' ),
 			'agent_email'    => '', // not in the lot payload; needs the contacts endpoint
-			'description'    => self::str( $lot['Description'] ?? '' ),
+			'description'    => self::clean_description( $lot['Description'] ?? '' ),
 		), $lot );
 	}
 
 	/**
-	 * Find the agents-CPT post for a manager name (cached per request).
-	 * An unknown manager gets a new agent post created automatically — with
-	 * the name only, since the lot payload carries nothing else; photo,
-	 * position, phone, and email are then filled in by the client under
-	 * wp-admin → Agents (logged so they know to).
+	 * Staff records from /v1/members, keyed by member id. Fetched once per
+	 * run; an API failure means no agent can be matched this run (matching is
+	 * by email, and the email lives here), which is logged rather than fatal.
+	 *
+	 * Note the portfolio owner's API/developer login also appears here; it is
+	 * not a property manager, so members are only ever used to enrich an agent
+	 * that a lot actually references.
 	 */
-	private static function find_agent( $name ) {
-		static $cache = array();
-		$name = trim( (string) $name );
-		if ( '' === $name ) {
-			return 0;
+	private static function members() {
+		static $members = null;
+		if ( null !== $members ) {
+			return $members;
 		}
-		if ( ! isset( $cache[ $name ] ) ) {
-			global $wpdb;
-			$cache[ $name ] = (int) $wpdb->get_var( $wpdb->prepare(
-				"SELECT ID FROM {$wpdb->posts} WHERE post_type = 'agents' AND post_status IN ('publish','draft') AND post_title = %s LIMIT 1",
-				$name
-			) );
-			if ( ! $cache[ $name ] ) {
-				$new_id = wp_insert_post( array(
-					'post_type'   => 'agents',
-					'post_status' => 'publish',
-					'post_title'  => $name,
-				), true );
-				if ( is_wp_error( $new_id ) ) {
-					PMS_Logger::error( 'Could not create agent post for "' . $name . '": ' . $new_id->get_error_message() );
-					$new_id = 0;
-				} else {
-					PMS_Logger::info( 'New agent "' . $name . '" found in PropertyMe — agent post created (add photo/phone/email under Agents in wp-admin).' );
-				}
-				$cache[ $name ] = (int) $new_id;
+		$members  = array( 'by_id' => array() );
+		$response = PMS_API::get( 'members' );
+		if ( is_wp_error( $response ) || ! is_array( $response ) ) {
+			if ( is_wp_error( $response ) ) {
+				PMS_Logger::info( 'Could not load PropertyMe members (agent contact details skipped): ' . $response->get_error_message() );
+			}
+			return $members;
+		}
+		foreach ( $response as $member ) {
+			if ( ! is_array( $member ) ) {
+				continue;
+			}
+			if ( ! empty( $member['Id'] ) ) {
+				$members['by_id'][ (string) $member['Id'] ] = $member;
 			}
 		}
-		return $cache[ $name ];
+		return $members;
+	}
+
+	/**
+	 * Contact details for a lot's manager, from /v1/members.
+	 *
+	 * Resolved on ActiveManagerMemberId — the id every lot carries and the
+	 * only exact link between a property and a staff profile. Missing fields
+	 * are simply absent: the agency has only filled some of the staff profiles
+	 * in PropertyMe.
+	 *
+	 * @return array{title:string,phone_number:string,email_address:string}
+	 */
+	private static function agent_details( $member_id ) {
+		$members = self::members();
+		$member  = null;
+
+		if ( $member_id && isset( $members['by_id'][ (string) $member_id ] ) ) {
+			$member = $members['by_id'][ (string) $member_id ];
+		}
+
+		if ( ! $member ) {
+			return array( 'title' => '', 'phone_number' => '', 'email_address' => '' );
+		}
+
+		// Mobile is the number the agency publishes; work phone is the fallback.
+		$phone = trim( (string) ( $member['MobilePhone'] ?? '' ) );
+		if ( '' === $phone ) {
+			$phone = trim( (string) ( $member['WorkPhone'] ?? '' ) );
+		}
+
+		return array(
+			'title'         => trim( (string) ( $member['JobTitle'] ?? '' ) ),
+			'phone_number'  => $phone,
+			'email_address' => trim( (string) ( $member['RegisteredEmail'] ?? '' ) ),
+		);
+	}
+
+	/**
+	 * Write agent contact fields, never overwriting details a person has
+	 * already filled in by hand in wp-admin.
+	 */
+	private static function fill_agent_fields( $agent_id, array $details ) {
+		foreach ( $details as $field => $value ) {
+			if ( '' === $value || ! isset( self::AGENT_FIELDS[ $field ] ) ) {
+				continue;
+			}
+			$meta_key = 'additional_fields_' . $field;
+			$existing = get_post_meta( $agent_id, $meta_key, true );
+			// ACF stores this group's values as single-item arrays.
+			$current  = is_array( $existing ) ? trim( (string) reset( $existing ) ) : trim( (string) $existing );
+			if ( '' !== $current ) {
+				continue; // respect anything entered manually
+			}
+			update_post_meta( $agent_id, $meta_key, array( $value ) );
+			update_post_meta( $agent_id, '_' . $meta_key, self::AGENT_FIELDS[ $field ] );
+		}
+	}
+
+	/**
+	 * Give a newly created agent the site's placeholder portrait, so agent
+	 * cards keep their layout until a real photo is uploaded. PropertyMe's API
+	 * never exposes staff photos, so this is always a manual follow-up.
+	 *
+	 * The image is chosen by the pms_agent_placeholder_image option (an
+	 * attachment id), falling back to an existing agent's photo so the
+	 * placeholder matches the site's own styling.
+	 */
+	private static function set_agent_placeholder_image( $agent_id ) {
+		if ( get_post_thumbnail_id( $agent_id ) ) {
+			return;
+		}
+
+		$attachment_id = (int) get_option( 'pms_agent_placeholder_image', 0 );
+
+		if ( ! $attachment_id || 'attachment' !== get_post_type( $attachment_id ) ) {
+			global $wpdb;
+			$attachment_id = (int) $wpdb->get_var( $wpdb->prepare(
+				"SELECT m.meta_value FROM {$wpdb->postmeta} m
+				 INNER JOIN {$wpdb->posts} p ON p.ID = m.post_id AND p.post_type = 'agents'
+				 WHERE m.meta_key = '_thumbnail_id' AND m.post_id != %d
+				 ORDER BY p.ID ASC LIMIT 1",
+				$agent_id
+			) );
+		}
+
+		if ( $attachment_id && 'attachment' === get_post_type( $attachment_id ) ) {
+			set_post_thumbnail( $agent_id, $attachment_id );
+		}
+	}
+
+	/**
+	 * The agents-CPT post for a manager, created if it doesn't exist yet.
+	 *
+	 * Matching is by EMAIL ADDRESS only. The email on PropertyMe's staff
+	 * profile (/v1/members, resolved from the lot's ActiveManagerMemberId) is
+	 * compared against the agent's email_address field in WordPress, so an
+	 * agent whose name is spelt differently on the two systems still resolves
+	 * to the same post — e.g. "Sharon Hamiton" in WordPress against
+	 * "Sharon Hamilton" in PropertyMe.
+	 *
+	 * A manager with no email on their PropertyMe staff profile cannot be
+	 * matched, and is left unlinked rather than guessed at by name, which
+	 * could attach properties to the wrong person. The log names anyone
+	 * affected so the agency can fill the profile in.
+	 *
+	 * @param string $name      Manager name from the lot (used for the post title only).
+	 * @param string $member_id PropertyMe ActiveManagerMemberId, when known.
+	 */
+	private static function find_agent( $name, $member_id = '' ) {
+		static $cache = array();
+		$name = trim( (string) $name );
+
+		$cache_key = $name . '|' . $member_id;
+		if ( isset( $cache[ $cache_key ] ) ) {
+			return $cache[ $cache_key ];
+		}
+
+		$details = self::agent_details( $member_id );
+		$email   = $details['email_address'];
+
+		if ( '' === $email ) {
+			PMS_Logger::info( sprintf(
+				'No email address on the PropertyMe staff profile for "%s" — property left without an agent. Add the email in PropertyMe, then re-sync.',
+				'' !== $name ? $name : 'member ' . $member_id
+			) );
+			$cache[ $cache_key ] = 0;
+			return 0;
+		}
+
+		global $wpdb;
+
+		// ACF stores this group's values as serialised single-item arrays, so
+		// match with LIKE rather than equality.
+		$agent_id = (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT p.ID FROM {$wpdb->posts} p
+			 INNER JOIN {$wpdb->postmeta} m ON m.post_id = p.ID AND m.meta_key = 'additional_fields_email_address'
+			 WHERE p.post_type = 'agents' AND p.post_status IN ('publish','draft') AND m.meta_value LIKE %s
+			 ORDER BY p.ID ASC LIMIT 1",
+			'%' . $wpdb->esc_like( $email ) . '%'
+		) );
+
+		if ( $agent_id && '' !== $name && get_the_title( $agent_id ) !== $name ) {
+			PMS_Logger::info( sprintf(
+				'Agent "%s" matched by email (%s) to the existing agent "%s" — the names differ between PropertyMe and WordPress.',
+				$name,
+				$email,
+				get_the_title( $agent_id )
+			) );
+		}
+
+		if ( ! $agent_id ) {
+			$new_id = wp_insert_post( array(
+				'post_type'   => 'agents',
+				'post_status' => 'publish',
+				'post_title'  => '' !== $name ? $name : $email,
+			), true );
+			if ( is_wp_error( $new_id ) ) {
+				PMS_Logger::error( 'Could not create agent post for "' . $name . '": ' . $new_id->get_error_message() );
+				$cache[ $cache_key ] = 0;
+				return 0;
+			}
+			$agent_id = (int) $new_id;
+			self::set_agent_placeholder_image( $agent_id );
+			PMS_Logger::info( sprintf(
+				'New agent "%s" (%s) found in PropertyMe — agent post created. Upload their photo under Agents in wp-admin; PropertyMe\'s API cannot supply one.',
+				$name,
+				$email
+			) );
+		}
+
+		// Fill blanks on new and existing agents alike; manual entries are kept.
+		self::fill_agent_fields( $agent_id, $details );
+
+		$cache[ $cache_key ] = $agent_id;
+		return $agent_id;
 	}
 
 	/** Scalar-to-string cast that refuses booleans/arrays (e.g. DisplayAddress). */
 	private static function str( $value ) {
 		return ( is_string( $value ) || is_int( $value ) || is_float( $value ) ) ? trim( (string) $value ) : '';
+	}
+
+	/**
+	 * Lot descriptions come from the CRM's rich-text editor wrapped in <div>
+	 * and <span> tags carrying inline font/colour styles, which would drag the
+	 * CRM's typography onto the site. Keep the text and its paragraph and list
+	 * structure, drop the styling.
+	 */
+	private static function clean_description( $value ) {
+		$html = self::str( $value );
+		if ( '' === $html ) {
+			return '';
+		}
+
+		// The editor uses block tags as line breaks; turn every block boundary
+		// into a newline before tags are stripped, so paragraphs and bullet
+		// lists survive instead of running into one another.
+		$html = preg_replace( '#<br\s*/?>#i', "\n", $html );
+		$html = preg_replace( '#</(div|p|li|h[1-6]|tr)\s*>#i', "\n", $html );
+		$html = preg_replace( '#<(div|p|li|h[1-6]|tr)\b[^>]*>#i', "\n", $html );
+		$html = wp_strip_all_tags( $html );
+		$html = html_entity_decode( $html, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+
+		// Some CRM entries arrive as one unbroken run of text — the line breaks
+		// were lost in PropertyMe's editor, not here. Re-break at the markers
+		// the copy itself uses so it doesn't render as a single wall of text:
+		// a bullet run-on ("dishwasher- Two separate"), and a heading that
+		// follows the end of a sentence ("living.WHAT LOOP LOVES:").
+		if ( false === strpos( $html, "\n" ) ) {
+			$html = preg_replace( '/(?<=[a-z0-9):.])\s*-\s+(?=[A-Z])/', "\n- ", $html );
+			$html = preg_replace( '/(?<=[a-z0-9)])\.(?=[A-Z]{2,})/', ".\n\n", $html );
+		}
+
+		// Collapse the runs of blank lines the editor leaves behind.
+		$html = preg_replace( "/[ \t]+\n/", "\n", $html );
+		$html = preg_replace( "/\n{3,}/", "\n\n", $html );
+
+		return trim( $html );
 	}
 
 	/** Expand the trailing AU street-type abbreviation to the site's naming style. */
@@ -356,15 +675,29 @@ class PMS_Sync {
 		// requires the cost_$ meta row to exist, else the post vanishes
 		// whenever a price range is applied.
 		self::set_field_meta( $post_id, 'cost_$', $row['rent'], true );
-		self::set_field_meta( $post_id, 'description', $row['description'] );
+		// Description: the CRM copy is the fallback. Where a listing has been
+		// published, REAXML carries the marketing ad copy — richer, and what
+		// goes to the portals — so never overwrite that with the CRM text.
+		if ( '' !== $row['description'] && ! get_post_meta( $post_id, '_pms_rea_unique_id', true ) ) {
+			self::set_field_meta( $post_id, 'description', $row['description'] );
+		}
 		self::set_field_meta( $post_id, 'property_type', $row['property_type'] );
 		// property_agent is an ACF post_object field → store the matching
 		// agents-CPT post ID, not the name string.
-		$agent_post_id = self::find_agent( $row['agent_name'] );
+		$raw          = json_decode( (string) ( $row['raw'] ?? '' ), true );
+		$manager_id   = is_array( $raw ) ? (string) ( $raw['ActiveManagerMemberId'] ?? '' ) : '';
+		$agent_post_id = self::find_agent( $row['agent_name'], $manager_id );
 		if ( $agent_post_id ) {
 			self::set_field_meta( $post_id, 'property_agent', (string) $agent_post_id );
 		}
-		self::set_field_meta( $post_id, 'property_agent_email', $row['agent_email'] );
+		// Prefer the manager's address from /v1/members; fall back to whatever
+		// the agent post already holds (someone may have typed it in wp-admin).
+		$agent_email = self::agent_details( $manager_id )['email_address'];
+		if ( '' === $agent_email && $agent_post_id ) {
+			$stored      = get_post_meta( $agent_post_id, 'additional_fields_email_address', true );
+			$agent_email = is_array( $stored ) ? (string) reset( $stored ) : (string) $stored;
+		}
+		self::set_field_meta( $post_id, 'property_agent_email', $agent_email );
 
 		// The map widget reads the ACF Google Map field "maps" (needs lat/lng);
 		// PropertyMe supplies coordinates in the lot's Address block (kept in raw).

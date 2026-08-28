@@ -35,9 +35,10 @@ No third-party plugin APIs are used anywhere: storage is `$wpdb`/`dbDelta`, fiel
   - Vacancy status → "For Lease"/"Leased" field + category
   - Google Map field populated from the lot's coordinates
   - Existing property URLs preserved (SEO)
-- **Agents** — properties link to the site's agent post type by manager name; unknown managers get an agent post auto-created (name only — photo/phone/email added once in wp-admin)
+- **Agents** — properties link to the site's agent post type **by email address** (from the manager's PropertyMe staff profile via `/v1/members`), so a name spelt differently on the two systems still resolves to the same agent. Job title, phone and email are imported; values already entered by hand in wp-admin are never overwritten. An unknown email gets an agent post auto-created with a placeholder portrait — photos are added once in wp-admin, as PropertyMe's API cannot supply them. A manager with no email on their PropertyMe profile is left unlinked and logged, rather than guessed at by name
+- **Incremental sync** — uses the API's `Timestamp` cursor to fetch only properties changed since the last run (a quiet portfolio costs one request returning nothing). Every 8th run does a full sweep, which also **moves properties archived in PropertyMe to Draft** — archiving removes a lot from `/lots` entirely, so only a full listing reveals it has gone. Posts are drafted, never deleted, so photos, layout and manual edits survive. Toggle in Settings; the cursor resets on disconnect.
+- **Photos come from REAXML only.** The API cannot supply them: `/v1/lots/{Id}/images` returns document metadata (`FileName`, `Size`, `Status`) with **no URL of any kind**, and the file is served from a host that accepts only a browser login session — never an API token. Confirmed 2026-08-28 against a real uploaded photo. The API-photo code has been removed rather than left dormant.
 - **Photos**
-  - API images (`lots/{id}/images`) imported per lot when present
   - **REA XML importer**: drop realestate.com.au-format feed files into `uploads/propertyme-feed/` (auto-created); imports photos (`url=` or `file=` alongside the XML), floorplans, listing descriptions, and inspection times; files archived to `processed/`; hash-based dedupe prevents re-imports
   - Featured image + gallery field + floorplan file field populated
 - **Detail-page layout** — prefers an Elementor **Theme Builder** "Single" template whose display condition covers property posts: Elementor renders every property from that one template, so nothing is stored per post and a design change reaches all properties at once. If no such template applies, the plugin falls back to cloning a layout (chosen in Settings, or auto-detected) onto the new post so properties are never left unstyled. Posts with their own layout are never touched.
@@ -57,6 +58,7 @@ No third-party plugin APIs are used anywhere: storage is `$wpdb`/`dbDelta`, fiel
    - Enter the **Client ID** and **Client Secret** exactly as issued (case-sensitive).
    - Confirm the **Redirect URI** — it must exactly match the redirect URL registered with PropertyMe for your client.
    - Leave endpoints and scopes at their defaults unless PropertyMe instructs otherwise. `offline_access` must stay enabled for unattended syncs.
+   - Only three scopes are requested — `property:read`, `contact:read`, `offline_access` — because only `/lots`, `/lots/{id}/images` and `/members` are ever called. The `activity:read`, `communication:read` and `transaction:read` scopes PropertyMe also documents were removed in 2026-08 (they cover activity feeds, messages and financial transactions the site has no use for). A saved six-scope value from an earlier version is migrated automatically on the next admin page load; existing tokens keep working, and the narrower set applies at the next authorisation.
 3. Click **Connect to PropertyMe**, log in with the portfolio account, and approve.
 4. Click **Sync now** and review the log and results.
 5. Enable **automatic sync via cron** and choose an interval.
