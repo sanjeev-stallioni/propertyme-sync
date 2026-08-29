@@ -116,6 +116,110 @@ class PMS_Sync {
 	}
 
 	/**
+	 * Next inspection per lot, from /v1/inspections (cached per request).
+	 *
+	 * PropertyMe's inspection list covers every property, not just those with
+	 * a published listing, so it fills the gap left by REAXML — which only
+	 * carries advertised open-home times for the handful of lots currently
+	 * being marketed.
+	 *
+	 * The MOST RECENT inspection wins — the client asked for the last
+	 * inspection that took place, not the next one scheduled. Sessions on the
+	 * same day are listed together, matching how REAXML inspections are
+	 * already displayed.
+	 *
+	 * PropertyMe stamps StartTime with a trailing "Z" but the value is already
+	 * local (Perth) time — verified against its own StartTimeText on all 45
+	 * records. So the timestamp is read as-is with gmdate(); converting it to
+	 * the site timezone would shift every inspection by the UTC offset.
+	 *
+	 * Note every record PropertyMe returns is flagged IsPublished = false and
+	 * most are Routine/Entry/Exit visits to tenanted homes. Showing them was
+	 * an explicit client decision; the type is deliberately not filtered.
+	 *
+	 * @return array<string,array{date:string,times:string}> keyed by lot id.
+	 */
+	private static function inspections() {
+		static $by_lot = null;
+		if ( null !== $by_lot ) {
+			return $by_lot;
+		}
+
+		$by_lot   = array();
+		$response = PMS_API::get( 'inspections' );
+		if ( is_wp_error( $response ) || ! is_array( $response ) ) {
+			if ( is_wp_error( $response ) ) {
+				PMS_Logger::info( 'Could not load inspections (inspection times skipped): ' . $response->get_error_message() );
+			}
+			return $by_lot;
+		}
+
+		$by_stamp = array();
+
+		foreach ( $response as $item ) {
+			if ( ! is_array( $item ) ) {
+				continue;
+			}
+			$lot_id = self::str( $item['LotId'] ?? '' );
+			$start  = self::str( $item['StartTime'] ?? '' );
+			if ( '' === $lot_id || '' === $start ) {
+				continue;
+			}
+			$stamp = strtotime( $start );
+			if ( ! $stamp ) {
+				continue;
+			}
+			// PropertyMe leaves EndTime null and gives Duration in minutes.
+			$minutes = (int) ( $item['Duration'] ?? 0 );
+			$by_stamp[ $lot_id ][] = array(
+				'stamp' => $stamp,
+				'end'   => $minutes > 0 ? $stamp + ( $minutes * MINUTE_IN_SECONDS ) : 0,
+			);
+		}
+
+		foreach ( $by_stamp as $lot_id => $items ) {
+			// Newest first, so $next is the most recent inspection.
+			usort( $items, static function ( $a, $b ) {
+				return $b['stamp'] <=> $a['stamp'];
+			} );
+			$next = $items[0];
+			$day  = gmdate( 'Y-m-d', $next['stamp'] );
+
+			// Same-day sessions read in chronological order, even though the
+			// list itself is sorted newest-first to find the latest day.
+			$same_day = array_values( array_filter( $items, static function ( $item ) use ( $day ) {
+				return gmdate( 'Y-m-d', $item['stamp'] ) === $day;
+			} ) );
+			usort( $same_day, static function ( $a, $b ) {
+				return $a['stamp'] <=> $b['stamp'];
+			} );
+
+			$times = array();
+			foreach ( $same_day as $item ) {
+				$slot = self::clock( $item['stamp'] );
+				if ( $item['end'] ) {
+					$slot .= ' - ' . self::clock( $item['end'] );
+				}
+				$times[] = $slot;
+			}
+
+			$by_lot[ $lot_id ] = array(
+				// Australian day-month-year: "WED 3 DEC 2026". Inspections can
+				// be months old or scheduled well ahead, so the year matters.
+				'date'  => strtoupper( gmdate( 'D j M Y', $next['stamp'] ) ),
+				'times' => implode( ', ', array_unique( $times ) ),
+			);
+		}
+
+		return $by_lot;
+	}
+
+	/** "4:00pm" — lowercase meridiem, no leading zero, as the site displays it. */
+	private static function clock( $stamp ) {
+		return strtolower( gmdate( 'g:ia', $stamp ) );
+	}
+
+	/**
 	 * Highest lot Timestamp seen so far. PropertyMe's Timestamp is an opaque
 	 * ascending int64 (not a date), and /v1/lots?Timestamp=N returns only lots
 	 * with a value strictly greater than N — so storing the maximum we have
@@ -190,10 +294,10 @@ class PMS_Sync {
 			return array( 'mode' => 'incremental', 'lots' => 0, 'changed' => 0 );
 		}
 
-		// Discovery aid: keep one raw sample so field mapping can be verified.
-		if ( $full ) {
-			PMS_Logger::info( 'Raw sample of first lot (for mapping verification).', reset( $lots ) );
-		}
+		// A raw lot sample used to be logged here to verify field mapping. It
+		// also wrote owner names, key numbers and internal CRM notes into the
+		// log table, so it was removed once the mapping was confirmed: the
+		// site has no reason to retain personal data it never displays.
 
 		$stored    = 0;
 		$projected = 0;
@@ -568,6 +672,64 @@ class PMS_Sync {
 		return $agent_id;
 	}
 
+	/**
+	 * Make sure a property type coming from PropertyMe exists as a choice on
+	 * the ACF select field.
+	 *
+	 * The field ships with a fixed list (House/Apartment/Townhouse/Unit) but
+	 * PropertyMe's PropertySubtype is free-form — "Duplex" already appears in
+	 * this portfolio, and the API spec declares no fixed set. A value outside
+	 * the list still displays on the front end, but wp-admin shows the select
+	 * with nothing matching, so opening and saving the property silently
+	 * wipes it. Adding the choice keeps the admin screen honest.
+	 *
+	 * @param string $type Property type from the lot payload.
+	 */
+	private static function ensure_property_type_choice( $type ) {
+		static $known = null;
+		$type = trim( (string) $type );
+		if ( '' === $type ) {
+			return;
+		}
+
+		global $wpdb;
+		if ( null === $known ) {
+			$known = array();
+			$row   = $wpdb->get_row( "SELECT ID, post_content FROM {$wpdb->posts} WHERE post_type = 'acf-field' AND post_excerpt = 'property_type' LIMIT 1" );
+			if ( ! $row ) {
+				$known = false; // no such field — nothing to maintain
+				return;
+			}
+			$config = maybe_unserialize( $row->post_content );
+			if ( ! is_array( $config ) || 'select' !== ( $config['type'] ?? '' ) ) {
+				$known = false;
+				return;
+			}
+			$known = array(
+				'id'      => (int) $row->ID,
+				'config'  => $config,
+				'choices' => (array) ( $config['choices'] ?? array() ),
+			);
+		}
+		if ( false === $known || isset( $known['choices'][ $type ] ) ) {
+			return;
+		}
+
+		$known['choices'][ $type ]     = $type;
+		$known['config']['choices']    = $known['choices'];
+		$wpdb->update( $wpdb->posts, array( 'post_content' => serialize( $known['config'] ) ), array( 'ID' => $known['id'] ) );
+		wp_cache_delete( $known['id'], 'posts' );
+
+		// The listing widget caches the filter list; drop it so the new type
+		// is filterable immediately rather than after the cache expires.
+		delete_transient( 'withpm_property_types' );
+
+		PMS_Logger::info( sprintf(
+			'Added "%s" to the Property Type options — PropertyMe uses a type the website did not have yet.',
+			$type
+		) );
+	}
+
 	/** Scalar-to-string cast that refuses booleans/arrays (e.g. DisplayAddress). */
 	private static function str( $value ) {
 		return ( is_string( $value ) || is_int( $value ) || is_float( $value ) ) ? trim( (string) $value ) : '';
@@ -681,7 +843,20 @@ class PMS_Sync {
 		if ( '' !== $row['description'] && ! get_post_meta( $post_id, '_pms_rea_unique_id', true ) ) {
 			self::set_field_meta( $post_id, 'description', $row['description'] );
 		}
+		self::ensure_property_type_choice( $row['property_type'] );
 		self::set_field_meta( $post_id, 'property_type', $row['property_type'] );
+
+		// Inspection times. REAXML carries the advertised open-home times for
+		// published listings and is the better source, so it is never
+		// overwritten; the API fills in every other property.
+		if ( ! get_post_meta( $post_id, '_pms_rea_inspection', true ) ) {
+			$inspections = self::inspections();
+			$lot_id      = self::str( $row['lot_id'] ?? '' );
+			if ( isset( $inspections[ $lot_id ] ) ) {
+				self::set_field_meta( $post_id, 'inspection_date', $inspections[ $lot_id ]['date'] );
+				self::set_field_meta( $post_id, 'inspection_times', $inspections[ $lot_id ]['times'] );
+			}
+		}
 		// property_agent is an ACF post_object field → store the matching
 		// agents-CPT post ID, not the name string.
 		$raw          = json_decode( (string) ( $row['raw'] ?? '' ), true );

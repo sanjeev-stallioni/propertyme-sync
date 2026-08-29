@@ -21,6 +21,12 @@ class PMS_Crypto {
 		return hash( 'sha256', 'pms-crypto-v1|' . $material, true ); // 32 bytes
 	}
 
+	/** Is this value already ciphertext produced by encrypt()? */
+	public static function is_encrypted( $stored ) {
+		$stored = (string) $stored;
+		return 0 === strpos( $stored, self::PREFIX_SODIUM ) || 0 === strpos( $stored, self::PREFIX_OPENSSL );
+	}
+
 	public static function encrypt( $plaintext ) {
 		$plaintext = (string) $plaintext;
 		if ( '' === $plaintext ) {

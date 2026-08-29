@@ -235,8 +235,9 @@ class PMS_REAXML {
 			}
 		}
 
-		// "WED 3 DEC" — the format the site's existing property pages use.
-		$date = strtoupper( gmdate( 'D j M', $next['stamp'] ) );
+		// Australian day-month-year: "WED 3 DEC 2026". The year is included so
+		// an older listing's inspection date is never read as this year's.
+		$date = strtoupper( gmdate( 'D j M Y', $next['stamp'] ) );
 
 		// Same-day extra sessions are appended to the times line.
 		$same_day = array();
@@ -288,6 +289,9 @@ class PMS_REAXML {
 				$parsed = self::split_inspections( $raw );
 				PMS_Sync::set_field_meta( $post_id, 'inspection_date', $parsed['date'] );
 				PMS_Sync::set_field_meta( $post_id, 'inspection_times', $parsed['times'] );
+				// Mark the advertised times as feed-owned so the API sync,
+				// which covers every property, does not overwrite them.
+				update_post_meta( $post_id, '_pms_rea_inspection', 1 );
 			}
 		}
 

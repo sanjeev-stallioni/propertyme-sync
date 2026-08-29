@@ -28,21 +28,23 @@ No third-party plugin APIs are used anywhere: storage is `$wpdb`/`dbDelta`, fiel
   - Client ID/secret entered in wp-admin, never in code
   - Secret and tokens encrypted at rest (libsodium, key derived from the site's `AUTH_KEY`/`AUTH_SALT` — a DB dump alone exposes nothing)
   - Write-only secret field; over-length paste guard
-- **Scheduled sync** — WP-Cron at 6/8/12-hour intervals, plus a "Sync now" button; overlap lock prevents concurrent runs
+- **Scheduled sync** — WP-Cron at 6/8/12-hour intervals, plus a "Sync now" button; overlap lock prevents concurrent runs. Note WordPress only runs cron on page visits, so a site with `DISABLE_WP_CRON` needs a server cron hitting `wp-cron.php`
 - **Property projection**
   - Posts created/updated in place, matched by PropertyMe lot id (`_pms_lot_id` meta) with address-based adoption of pre-existing manual posts (hijack-guarded)
   - Address titles built in the site's style (unit/number + street-type abbreviations expanded: "Rd" → "Road")
   - Vacancy status → "For Lease"/"Leased" field + category
   - Google Map field populated from the lot's coordinates
   - Existing property URLs preserved (SEO)
+  - **Description** from the lot's CRM copy, stripped of the editor's inline font/colour styles and re-broken into paragraphs and bullets; REAXML ad copy takes precedence where a listing is published
+  - **Property type** from `PropertySubtype` (falling back to `PropertyType`). The ACF select's choices are extended automatically when PropertyMe uses a type the site does not have yet — the list ships with four but the API declares no fixed set, and a value outside it would be silently wiped by wp-admin
+  - **Inspection date/time** from `/v1/inspections`, matched on `LotId`, showing the most recent inspection in Australian format with the year ("WED 3 DEC 2026"). REAXML open-home times win where a listing is published. Note PropertyMe stamps `StartTime` with a trailing `Z` but the value is already local time — converting it would shift every inspection
 - **Agents** — properties link to the site's agent post type **by email address** (from the manager's PropertyMe staff profile via `/v1/members`), so a name spelt differently on the two systems still resolves to the same agent. Job title, phone and email are imported; values already entered by hand in wp-admin are never overwritten. An unknown email gets an agent post auto-created with a placeholder portrait — photos are added once in wp-admin, as PropertyMe's API cannot supply them. A manager with no email on their PropertyMe profile is left unlinked and logged, rather than guessed at by name
 - **Incremental sync** — uses the API's `Timestamp` cursor to fetch only properties changed since the last run (a quiet portfolio costs one request returning nothing). Every 8th run does a full sweep, which also **moves properties archived in PropertyMe to Draft** — archiving removes a lot from `/lots` entirely, so only a full listing reveals it has gone. Posts are drafted, never deleted, so photos, layout and manual edits survive. Toggle in Settings; the cursor resets on disconnect.
 - **Photos come from REAXML only.** The API cannot supply them: `/v1/lots/{Id}/images` returns document metadata (`FileName`, `Size`, `Status`) with **no URL of any kind**, and the file is served from a host that accepts only a browser login session — never an API token. Confirmed 2026-08-28 against a real uploaded photo. The API-photo code has been removed rather than left dormant.
-- **Photos**
   - **REA XML importer**: drop realestate.com.au-format feed files into `uploads/propertyme-feed/` (auto-created); imports photos (`url=` or `file=` alongside the XML), floorplans, listing descriptions, and inspection times; files archived to `processed/`; hash-based dedupe prevents re-imports
   - Featured image + gallery field + floorplan file field populated
 - **Detail-page layout** — prefers an Elementor **Theme Builder** "Single" template whose display condition covers property posts: Elementor renders every property from that one template, so nothing is stored per post and a design change reaches all properties at once. If no such template applies, the plugin falls back to cloning a layout (chosen in Settings, or auto-detected) onto the new post so properties are never left unstyled. Posts with their own layout are never touched.
-- **Logging** — activity log in the plugin's own `wp_pms_log` table (never autoloaded, capped at 1000 rows, All/Errors filter on the settings page), including a raw sample of the first lot each sync for mapping verification
+- **Logging** — activity log in the plugin's own `wp_pms_log` table (never autoloaded, capped at 1000 rows, All/Errors filter on the settings page). Lot payloads are deliberately **not** logged: they carry owner names, key numbers and internal CRM notes the site never displays
 - **Clean uninstall** — custom table, settings, tokens, and logs removed
 
 ## Requirements
@@ -95,6 +97,9 @@ This plugin was built against one site's data model and needs adapting for reuse
 - The encryption key derives from the site's salts: encrypted values are per-site and cannot be copied between installs — re-enter credentials on each environment.
 - All admin actions are nonce- and capability-checked; OAuth state is single-use with expiry.
 - PropertyMe's internal `Notes` field is deliberately never synced to the public site.
+- Only three OAuth scopes are requested — `property:read`, `contact:read`, `offline_access` — because only `/lots`, `/inspections` and `/members` are called. The activity, communication and transaction scopes PropertyMe also documents are deliberately not requested: they would grant access to activity feeds, messages and financial data (tenant ledgers, owner statements, rent payments) the site has no use for. A six-scope value saved by an earlier version is narrowed automatically.
+- All API access is **read-only**; the plugin issues no writes to PropertyMe.
+- A client secret saved before encryption existed is re-encrypted in place on the next admin page load, so a plaintext value never persists.
 
 ## License
 

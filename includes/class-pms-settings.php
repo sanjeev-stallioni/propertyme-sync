@@ -33,6 +33,28 @@ class PMS_Settings {
 	const RETIRED_SCOPES = array( 'activity:read', 'communication:read', 'transaction:read' );
 
 	/**
+	 * Encrypt a client secret saved before encryption existed.
+	 *
+	 * PMS_Crypto::decrypt() deliberately returns unrecognised values as-is so
+	 * an older plaintext secret keeps working, but that means it would sit in
+	 * the options table in the clear indefinitely. Re-save it as ciphertext
+	 * once, so a database dump no longer exposes it.
+	 */
+	public static function maybe_encrypt_secret() {
+		$saved = get_option( 'pms_settings', array() );
+		if ( ! is_array( $saved ) ) {
+			return;
+		}
+		$secret = (string) ( $saved['client_secret'] ?? '' );
+		if ( '' === $secret || PMS_Crypto::is_encrypted( $secret ) ) {
+			return;
+		}
+		$saved['client_secret'] = PMS_Crypto::encrypt( $secret );
+		update_option( 'pms_settings', $saved );
+		PMS_Logger::info( 'Client secret was stored in plain text and has been encrypted.' );
+	}
+
+	/**
 	 * Drop retired scopes from a value saved by an earlier version.
 	 *
 	 * Without this the stored option keeps asking for permissions the plugin
@@ -61,6 +83,7 @@ class PMS_Settings {
 	public static function init() {
 		add_action( 'admin_menu', array( __CLASS__, 'menu' ) );
 		add_action( 'admin_init', array( __CLASS__, 'maybe_migrate_scope' ) );
+		add_action( 'admin_init', array( __CLASS__, 'maybe_encrypt_secret' ) );
 		add_action( 'admin_init', array( __CLASS__, 'register' ) );
 		add_action( 'admin_post_pms_connect', array( __CLASS__, 'handle_connect' ) );
 		add_action( 'admin_post_pms_disconnect', array( __CLASS__, 'handle_disconnect' ) );
@@ -115,7 +138,16 @@ class PMS_Settings {
 			);
 			$secret = '';
 		}
-		$out['client_secret'] = '' !== $secret ? PMS_Crypto::encrypt( $secret ) : ( $old['client_secret'] ?? '' );
+		if ( '' !== $secret ) {
+			$out['client_secret'] = PMS_Crypto::encrypt( $secret );
+		} else {
+			// Keep the stored secret, upgrading it in place if it predates
+			// encryption — otherwise a plaintext value would survive forever.
+			$kept = (string) ( $old['client_secret'] ?? '' );
+			$out['client_secret'] = ( '' !== $kept && ! PMS_Crypto::is_encrypted( $kept ) )
+				? PMS_Crypto::encrypt( $kept )
+				: $kept;
+		}
 
 		return $out;
 	}
