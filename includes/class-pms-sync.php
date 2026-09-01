@@ -150,7 +150,7 @@ class PMS_Sync {
 		$response = PMS_API::get( 'inspections' );
 		if ( is_wp_error( $response ) || ! is_array( $response ) ) {
 			if ( is_wp_error( $response ) ) {
-				PMS_Logger::info( 'Could not load inspections (inspection times skipped): ' . $response->get_error_message() );
+				PMS_Logger::error( 'Could not load inspections (inspection date/times/summary skipped): ' . $response->get_error_message() );
 			}
 			return $by_lot;
 		}

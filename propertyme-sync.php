@@ -39,7 +39,7 @@ function pms_get_settings() {
 		'authorize_endpoint' => 'https://login.propertyme.com/connect/authorize',
 		'token_endpoint'     => 'https://login.propertyme.com/connect/token',
 		'api_base'           => 'https://app.propertyme.com/api/v1',
-		'scope'              => 'contact:read property:read offline_access',
+		'scope'              => 'contact:read property:read activity:read offline_access',
 		'redirect_uri'       => home_url( '/home/callback' ),
 		'sync_interval'      => 'pms_12h',
 		'sync_enabled'       => 0,

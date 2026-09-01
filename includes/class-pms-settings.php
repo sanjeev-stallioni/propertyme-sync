@@ -13,24 +13,35 @@ class PMS_Settings {
 	const PAGE = 'propertyme-sync';
 
 	/**
-	 * The scopes this integration actually needs.
+	 * The scopes this integration actually needs, per PropertyMe's own
+	 * OpenAPI spec (app.propertyme.com/api/openapi):
 	 *
-	 * Only two endpoints are ever called — /lots (property:read) and
-	 * /members (contact:read) — so the activity,
-	 * communication and transaction scopes PropertyMe also documents are
-	 * deliberately not requested: they would grant access to activity feeds,
-	 * messages and financial transactions (tenant ledgers, owner statements,
-	 * rent payments) that the website has no use for. Removed 2026-08-28;
-	 * see maybe_migrate_scope() for the upgrade path.
+	 *   /lots, /lots/archived  -> property:read
+	 *   /members, /contacts    -> contact:read
+	 *   /inspections           -> activity:read  (inspections are filed under
+	 *                             "Activities", not "Property")
+	 *
+	 * activity:read was wrongly retired on 2026-08-28 along with the truly
+	 * unused scopes; a token issued without it gets HTTP 401 from
+	 * /v1/inspections. The mistake stayed invisible on any site whose refresh
+	 * token predated the narrowing — refresh tokens keep their original
+	 * grant — and only surfaced on a fresh connect. Restored 2026-09-01; see
+	 * maybe_restore_activity_scope() for the saved-settings repair.
+	 *
+	 * communication:read and transaction:read remain deliberately not
+	 * requested: they would grant access to messages and financial data
+	 * (tenant ledgers, owner statements, rent payments) the site has no use
+	 * for.
 	 */
 	const SCOPES = array(
 		'contact:read'   => 'Contact (read) — agent name, email, phone, job title',
 		'property:read'  => 'Property (read) — the properties themselves',
+		'activity:read'  => 'Activity (read) — inspection dates, times and summaries',
 		'offline_access' => 'Offline access — refresh token for unattended syncs',
 	);
 
 	/** Scopes previously requested that are no longer used. */
-	const RETIRED_SCOPES = array( 'activity:read', 'communication:read', 'transaction:read' );
+	const RETIRED_SCOPES = array( 'communication:read', 'transaction:read' );
 
 	/**
 	 * Encrypt a client secret saved before encryption existed.
@@ -81,6 +92,39 @@ class PMS_Settings {
 	}
 
 	/**
+	 * Put activity:read back into a saved scope the earlier migration
+	 * stripped it from.
+	 *
+	 * The 2026-08-28 narrowing wrongly retired activity:read, which
+	 * /v1/inspections requires, and maybe_migrate_scope() then removed it
+	 * from settings that had it. Add it back once. One-time (flagged) so a
+	 * deliberate later deselection in the settings UI is respected.
+	 *
+	 * The repaired scope only applies to the NEXT authorisation — an existing
+	 * token issued without activity:read stays limited until the site is
+	 * disconnected and reconnected.
+	 */
+	public static function maybe_restore_activity_scope() {
+		if ( get_option( 'pms_scope_activity_restored' ) ) {
+			return;
+		}
+		update_option( 'pms_scope_activity_restored', 1, false );
+
+		$saved = get_option( 'pms_settings', array() );
+		if ( ! is_array( $saved ) || empty( $saved['scope'] ) || ! is_string( $saved['scope'] ) ) {
+			return;
+		}
+		$current = preg_split( '/\s+/', trim( $saved['scope'] ) );
+		if ( in_array( 'activity:read', $current, true ) ) {
+			return;
+		}
+		$current[]      = 'activity:read';
+		$saved['scope'] = implode( ' ', array_values( array_intersect( array_keys( self::SCOPES ), $current ) ) );
+		update_option( 'pms_settings', $saved );
+		PMS_Logger::info( 'Restored the activity:read API permission — PropertyMe requires it for inspection data (/v1/inspections). Disconnect and reconnect to PropertyMe so the new permission takes effect.' );
+	}
+
+	/**
 	 * Move sites off the retired 5-minute testing interval.
 	 *
 	 * That option existed only to watch a full cron cycle during development
@@ -109,6 +153,7 @@ class PMS_Settings {
 		add_action( 'admin_menu', array( __CLASS__, 'menu' ) );
 		add_action( 'admin_init', array( __CLASS__, 'maybe_migrate_interval' ) );
 		add_action( 'admin_init', array( __CLASS__, 'maybe_migrate_scope' ) );
+		add_action( 'admin_init', array( __CLASS__, 'maybe_restore_activity_scope' ) );
 		add_action( 'admin_init', array( __CLASS__, 'maybe_encrypt_secret' ) );
 		add_action( 'admin_init', array( __CLASS__, 'register' ) );
 		add_action( 'admin_post_pms_connect', array( __CLASS__, 'handle_connect' ) );

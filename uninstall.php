@@ -15,6 +15,7 @@ delete_option( 'pms_last_sync' );
 delete_option( 'pms_delta_cursor' );
 delete_option( 'pms_delta_runs' );
 delete_option( 'pms_orphan_summaries_cleared' );
+delete_option( 'pms_scope_activity_restored' );
 delete_option( 'pms_agent_placeholder_image' );
 delete_option( 'pms_layout_template_post' );
 delete_transient( 'pms_sync_running' );
