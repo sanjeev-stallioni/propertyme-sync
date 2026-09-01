@@ -270,7 +270,14 @@ class PMS_REAXML {
 		update_post_meta( $post_id, '_pms_rea_unique_id', $unique_id );
 
 		// Ad copy and inspections come from the listing, not the CRM lot.
-		$description = trim( (string) $listing->description );
+		//
+		// The feed is third-party content and its description may carry markup
+		// (REAXML wraps ad copy in CDATA, so tags survive the parser intact).
+		// The ACF field is a textarea, which ACF renders WITHOUT escaping, so
+		// anything stored here reaches the page as live HTML. Run it through
+		// the same stripper the API copy uses, which keeps the paragraph
+		// breaks and drops every tag.
+		$description = PMS_Sync::clean_description( (string) $listing->description );
 		if ( '' !== $description ) {
 			PMS_Sync::set_field_meta( $post_id, 'description', $description );
 		}
@@ -289,6 +296,10 @@ class PMS_REAXML {
 				$parsed = self::split_inspections( $raw );
 				PMS_Sync::set_field_meta( $post_id, 'inspection_date', $parsed['date'] );
 				PMS_Sync::set_field_meta( $post_id, 'inspection_times', $parsed['times'] );
+				// REAXML has no inspection summary, and any summary already on
+				// the page came from the API describing a different event, so
+				// it is cleared — the page falls back to its default line.
+				PMS_Sync::set_field_meta( $post_id, 'inspection_description', '', true );
 				// Mark the advertised times as feed-owned so the API sync,
 				// which covers every property, does not overwrite them.
 				update_post_meta( $post_id, '_pms_rea_inspection', 1 );

@@ -48,6 +48,7 @@ class PMS_Sync {
 		'description'          => 'field_69e80b72d9eba',
 		'inspection_date'      => 'field_69e80d5a7c5af',
 		'inspection_times'     => 'field_69e80ba1c7dec',
+		'inspection_description' => 'field_6523140adc629',
 		'maps'                 => 'field_69e80baec7ded',
 		'property_agent'       => 'field_6a06be98c4e3c',
 		'property_agent_email' => 'field_6a0c32ccb6ce8',
@@ -61,9 +62,6 @@ class PMS_Sync {
 	}
 
 	public static function cron_schedules( $schedules ) {
-		// TESTING ONLY — remove before release. Lets a full cron cycle be
-		// observed in minutes instead of hours; far too frequent for live use.
-		$schedules['pms_5min'] = array( 'interval' => 5 * MINUTE_IN_SECONDS, 'display' => 'Every 5 minutes (PropertyMe — TESTING ONLY)' );
 		$schedules['pms_6h']  = array( 'interval' => 6 * HOUR_IN_SECONDS,  'display' => 'Every 6 hours (PropertyMe)' );
 		$schedules['pms_8h']  = array( 'interval' => 8 * HOUR_IN_SECONDS,  'display' => 'Every 8 hours (PropertyMe)' );
 		$schedules['pms_12h'] = array( 'interval' => 12 * HOUR_IN_SECONDS, 'display' => 'Every 12 hours (PropertyMe)' );
@@ -108,6 +106,9 @@ class PMS_Sync {
 			update_option( 'pms_last_sync', current_time( 'mysql' ), false );
 			PMS_Logger::info( 'Sync finished.', $counts );
 			PMS_REAXML::import_dir();
+			// After the feed has run, so anything it has just marked as
+			// feed-owned is included.
+			self::clear_orphan_summaries();
 		} catch ( Throwable $e ) {
 			PMS_Logger::error( 'Sync crashed: ' . $e->getMessage() );
 		} finally {
@@ -172,8 +173,13 @@ class PMS_Sync {
 			// PropertyMe leaves EndTime null and gives Duration in minutes.
 			$minutes = (int) ( $item['Duration'] ?? 0 );
 			$by_stamp[ $lot_id ][] = array(
-				'stamp' => $stamp,
-				'end'   => $minutes > 0 ? $stamp + ( $minutes * MINUTE_IN_SECONDS ) : 0,
+				'stamp'   => $stamp,
+				'end'     => $minutes > 0 ? $stamp + ( $minutes * MINUTE_IN_SECONDS ) : 0,
+				// PropertyMe pre-fills Summary with "<Type> at <address>". The
+				// agency can overwrite it with copy meant for the public page,
+				// which is what the site displays; see the note on the
+				// projection below.
+				'summary' => self::str( $item['Summary'] ?? '' ),
 			);
 		}
 
@@ -206,8 +212,9 @@ class PMS_Sync {
 			$by_lot[ $lot_id ] = array(
 				// Australian day-month-year: "WED 3 DEC 2026". Inspections can
 				// be months old or scheduled well ahead, so the year matters.
-				'date'  => strtoupper( gmdate( 'D j M Y', $next['stamp'] ) ),
-				'times' => implode( ', ', array_unique( $times ) ),
+				'date'        => strtoupper( gmdate( 'D j M Y', $next['stamp'] ) ),
+				'times'       => implode( ', ', array_unique( $times ) ),
+				'description' => $next['summary'],
 			);
 		}
 
@@ -343,6 +350,50 @@ class PMS_Sync {
 		}
 
 		return $counts;
+	}
+
+	/**
+	 * Drop inspection summaries left on feed-owned properties.
+	 *
+	 * An earlier version wrote the API summary onto every property, including
+	 * those whose date and time come from REAXML. That left the two describing
+	 * different inspections — the feed advertises the home open, while the API
+	 * record is often a routine entry inspection on another day.
+	 *
+	 * The summary is now only written alongside an API date, but values stored
+	 * before that change persist until the feed next covers the property. This
+	 * clears them once, so existing sites heal on their first sync rather than
+	 * waiting for a listing to be re-published.
+	 */
+	private static function clear_orphan_summaries() {
+		if ( get_option( 'pms_orphan_summaries_cleared' ) ) {
+			return;
+		}
+
+		global $wpdb;
+		$post_ids = $wpdb->get_col(
+			"SELECT DISTINCT rea.post_id
+			   FROM {$wpdb->postmeta} rea
+			  INNER JOIN {$wpdb->postmeta} summary
+			     ON summary.post_id = rea.post_id
+			    AND summary.meta_key = 'inspection_description'
+			  WHERE rea.meta_key = '_pms_rea_inspection'
+			    AND rea.meta_value = '1'
+			    AND summary.meta_value <> ''"
+		);
+
+		foreach ( $post_ids as $post_id ) {
+			self::set_field_meta( (int) $post_id, 'inspection_description', '', true );
+		}
+
+		update_option( 'pms_orphan_summaries_cleared', 1, false );
+
+		if ( $post_ids ) {
+			PMS_Logger::info( sprintf(
+				'Cleared %d inspection summary/summaries that described a different inspection to the advertised date.',
+				count( $post_ids )
+			) );
+		}
 	}
 
 	/**
@@ -626,14 +677,24 @@ class PMS_Sync {
 
 		global $wpdb;
 
-		// ACF stores this group's values as serialised single-item arrays, so
-		// match with LIKE rather than equality.
-		$agent_id = (int) $wpdb->get_var( $wpdb->prepare(
+		// ACF stores this group's values as serialised single-item arrays
+		// (a:1:{i:0;s:21:"someone@example.com";}), but a plain string can also
+		// be present if someone edited the field outside ACF. Match both forms
+		// EXACTLY.
+		//
+		// A LIKE '%email%' must not be used here: it matches any address that
+		// merely CONTAINS the one being looked up, so "jo@withpm.com.au" would
+		// also match "xjo@withpm.com.au" and silently attach every one of that
+		// manager's properties to the wrong agent.
+		$serialised = serialize( array( $email ) );
+		$agent_id   = (int) $wpdb->get_var( $wpdb->prepare(
 			"SELECT p.ID FROM {$wpdb->posts} p
 			 INNER JOIN {$wpdb->postmeta} m ON m.post_id = p.ID AND m.meta_key = 'additional_fields_email_address'
-			 WHERE p.post_type = 'agents' AND p.post_status IN ('publish','draft') AND m.meta_value LIKE %s
+			 WHERE p.post_type = 'agents' AND p.post_status IN ('publish','draft')
+			   AND ( m.meta_value = %s OR m.meta_value = %s )
 			 ORDER BY p.ID ASC LIMIT 1",
-			'%' . $wpdb->esc_like( $email ) . '%'
+			$serialised,
+			$email
 		) );
 
 		if ( $agent_id && '' !== $name && get_the_title( $agent_id ) !== $name ) {
@@ -741,7 +802,7 @@ class PMS_Sync {
 	 * CRM's typography onto the site. Keep the text and its paragraph and list
 	 * structure, drop the styling.
 	 */
-	private static function clean_description( $value ) {
+	public static function clean_description( $value ) {
 		$html = self::str( $value );
 		if ( '' === $html ) {
 			return '';
@@ -846,16 +907,29 @@ class PMS_Sync {
 		self::ensure_property_type_choice( $row['property_type'] );
 		self::set_field_meta( $post_id, 'property_type', $row['property_type'] );
 
-		// Inspection times. REAXML carries the advertised open-home times for
-		// published listings and is the better source, so it is never
-		// overwritten; the API fills in every other property.
-		if ( ! get_post_meta( $post_id, '_pms_rea_inspection', true ) ) {
-			$inspections = self::inspections();
-			$lot_id      = self::str( $row['lot_id'] ?? '' );
-			if ( isset( $inspections[ $lot_id ] ) ) {
-				self::set_field_meta( $post_id, 'inspection_date', $inspections[ $lot_id ]['date'] );
-				self::set_field_meta( $post_id, 'inspection_times', $inspections[ $lot_id ]['times'] );
-			}
+		// Inspection details from /v1/inspections.
+		//
+		// Date, time and summary must all describe the SAME inspection, so
+		// they are treated as one block from a single source. REAXML carries
+		// the advertised open-home times for published listings and is the
+		// better source for date/time, so where the feed has set them the API
+		// block is skipped entirely — including the summary, which would
+		// otherwise describe a different event to the date shown above it
+		// (the feed advertises the home open; the API record is often a
+		// routine entry inspection on another day).
+		//
+		// REAXML has no inspection summary of its own, so those properties
+		// fall back to the page's default enquiry line.
+		$inspections = self::inspections();
+		$lot_id      = self::str( $row['lot_id'] ?? '' );
+		if ( isset( $inspections[ $lot_id ] ) && ! get_post_meta( $post_id, '_pms_rea_inspection', true ) ) {
+			self::set_field_meta( $post_id, 'inspection_date', $inspections[ $lot_id ]['date'] );
+			self::set_field_meta( $post_id, 'inspection_times', $inspections[ $lot_id ]['times'] );
+			// Written as PropertyMe supplies it: the agency asked for their
+			// own text verbatim, so the auto-generated wording is not
+			// filtered out. The page falls back to its default line when this
+			// is empty.
+			self::set_field_meta( $post_id, 'inspection_description', $inspections[ $lot_id ]['description'] );
 		}
 		// property_agent is an ACF post_object field → store the matching
 		// agents-CPT post ID, not the name string.

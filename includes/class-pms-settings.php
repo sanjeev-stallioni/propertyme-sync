@@ -80,8 +80,34 @@ class PMS_Settings {
 		) );
 	}
 
+	/**
+	 * Move sites off the retired 5-minute testing interval.
+	 *
+	 * That option existed only to watch a full cron cycle during development
+	 * and has been removed. A site still holding it would keep a sync_interval
+	 * that no longer resolves to a registered schedule, so wp_schedule_event()
+	 * would silently refuse to re-arm and the site would quietly stop syncing.
+	 * Fall back to the 12-hour default and re-arm the schedule.
+	 */
+	public static function maybe_migrate_interval() {
+		$saved = get_option( 'pms_settings', array() );
+		if ( ! is_array( $saved ) || ( $saved['sync_interval'] ?? '' ) !== 'pms_5min' ) {
+			return;
+		}
+		$saved['sync_interval'] = 'pms_12h';
+		update_option( 'pms_settings', $saved );
+
+		// Re-arm on the new interval, or the old event keeps its dead schedule.
+		wp_clear_scheduled_hook( PMS_Sync::CRON_HOOK );
+		if ( ! empty( $saved['sync_enabled'] ) ) {
+			wp_schedule_event( time() + MINUTE_IN_SECONDS, 'pms_12h', PMS_Sync::CRON_HOOK );
+		}
+		PMS_Logger::info( 'The 5-minute testing sync interval has been retired; this site is now set to every 12 hours.' );
+	}
+
 	public static function init() {
 		add_action( 'admin_menu', array( __CLASS__, 'menu' ) );
+		add_action( 'admin_init', array( __CLASS__, 'maybe_migrate_interval' ) );
 		add_action( 'admin_init', array( __CLASS__, 'maybe_migrate_scope' ) );
 		add_action( 'admin_init', array( __CLASS__, 'maybe_encrypt_secret' ) );
 		add_action( 'admin_init', array( __CLASS__, 'register' ) );
@@ -118,7 +144,7 @@ class PMS_Settings {
 			'api_base'           => untrailingslashit( esc_url_raw( $input['api_base'] ?? '' ) ),
 			'scope'              => self::sanitize_scope( $input['scope'] ?? array() ),
 			'redirect_uri'       => esc_url_raw( $input['redirect_uri'] ?? home_url( '/home/callback' ) ),
-			'sync_interval'      => in_array( $input['sync_interval'] ?? '', array( 'pms_5min', 'pms_6h', 'pms_8h', 'pms_12h' ), true ) ? $input['sync_interval'] : 'pms_12h',
+			'sync_interval'      => in_array( $input['sync_interval'] ?? '', array( 'pms_6h', 'pms_8h', 'pms_12h' ), true ) ? $input['sync_interval'] : 'pms_12h',
 			'sync_enabled'       => empty( $input['sync_enabled'] ) ? 0 : 1,
 			'delta_sync'         => empty( $input['delta_sync'] ) ? 0 : 1,
 			'feed_dir'           => self::sanitize_feed_dir( $input['feed_dir'] ?? '' ),
@@ -399,8 +425,6 @@ class PMS_Settings {
 						<th scope="row"><label for="pms_interval">Interval</label></th>
 						<td>
 							<select name="pms_settings[sync_interval]" id="pms_interval">
-								<?php // TESTING ONLY — remove this option before release. ?>
-								<option value="pms_5min" <?php selected( $s['sync_interval'], 'pms_5min' ); ?>>Every 5 minutes (testing only)</option>
 								<option value="pms_6h" <?php selected( $s['sync_interval'], 'pms_6h' ); ?>>Every 6 hours</option>
 								<option value="pms_8h" <?php selected( $s['sync_interval'], 'pms_8h' ); ?>>Every 8 hours</option>
 								<option value="pms_12h" <?php selected( $s['sync_interval'], 'pms_12h' ); ?>>Every 12 hours</option>

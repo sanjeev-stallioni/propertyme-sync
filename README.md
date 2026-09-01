@@ -100,6 +100,10 @@ This plugin was built against one site's data model and needs adapting for reuse
 - Only three OAuth scopes are requested — `property:read`, `contact:read`, `offline_access` — because only `/lots`, `/inspections` and `/members` are called. The activity, communication and transaction scopes PropertyMe also documents are deliberately not requested: they would grant access to activity feeds, messages and financial data (tenant ledgers, owner statements, rent payments) the site has no use for. A six-scope value saved by an earlier version is narrowed automatically.
 - All API access is **read-only**; the plugin issues no writes to PropertyMe.
 - A client secret saved before encryption existed is re-encrypted in place on the next admin page load, so a plaintext value never persists.
+- Text from both sources is stripped of all HTML before it is stored. The ACF fields it lands in are textareas, which ACF renders **without** escaping, so an unsanitised description from the REAXML feed (third-party content, CDATA-wrapped) would otherwise execute as markup on the property page.
+- Agents are matched on an **exact** email comparison. A `LIKE '%email%'` must never be reintroduced here: it also matches any address merely *containing* the one looked up, so `jo@example.com` would match `xjo@example.com` and silently attach a manager's whole portfolio to the wrong agent.
+- Feed files are moved out of the (publicly reachable) drop directory before they are parsed, and the archive directory is `.htaccess`-denied. The configurable drop path rejects traversal and cannot escape `ABSPATH`.
+- Imported media goes through `media_handle_sideload()`, so WordPress's allowed-MIME list applies; PHP and double-extension payloads are rejected.
 
 ## License
 
